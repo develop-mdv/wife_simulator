@@ -1,11 +1,12 @@
 """
 Main module for TG Wife AI.
-Handles Telegram client, message processing, and Gemini integration.
+Handles Telegram client, message processing, Gemini integration, and admin bot.
 """
 
 import asyncio
 import logging
 import sys
+import time
 from datetime import datetime, time as dt_time
 from typing import Optional
 
@@ -18,6 +19,8 @@ from .config import get_config, Config
 from .db import Database
 from .prompt import build_instructions, format_pending_messages
 from .rate_limit import RateLimiter
+from .settings_manager import SettingsManager
+from .admin_bot import create_admin_bot
 
 
 # Configure logging
@@ -33,9 +36,10 @@ logger = logging.getLogger(__name__)
 class WifeBot:
     """Main bot class handling all message processing."""
     
-    def __init__(self, config: Config):
+    def __init__(self, config: Config, settings: SettingsManager, db: Database):
         self.config = config
-        self.db = Database(config.db_path)
+        self.settings = settings
+        self.db = db
         self.rate_limiter = RateLimiter(
             max_count=config.rate_limit_count,
             window_seconds=config.rate_limit_window_sec,
@@ -55,43 +59,67 @@ class WifeBot:
             config.tg_api_hash,
         )
         
-        # Resolved target user ID (set during startup)
-        self.target_user_id: Optional[int] = config.target_user_id
+        # Resolved target user ID (set during startup or from settings)
+        self.target_user_id: Optional[int] = None
         
         # Queue processor task
         self._queue_processor_task: Optional[asyncio.Task] = None
     
+    def _get_target_user_id(self) -> Optional[int]:
+        """Get target user ID from settings (priority) or config."""
+        # Settings has priority
+        settings_id = self.settings.get_int("target_user_id", 0)
+        if settings_id > 0:
+            return settings_id
+        return self.config.target_user_id
+    
+    def _get_target_username(self) -> Optional[str]:
+        """Get target username from settings (priority) or config."""
+        settings_username = self.settings.get_str("target_username", "")
+        if settings_username:
+            return settings_username
+        return self.config.target_username
+    
     async def resolve_target_user(self) -> None:
         """Resolve target user from username if needed."""
+        self.target_user_id = self._get_target_user_id()
+        
         if self.target_user_id:
             logger.info(f"✓ Using target user ID: {self.target_user_id}")
             return
         
-        if self.config.target_username:
-            logger.info(f"Resolving username: @{self.config.target_username}")
+        target_username = self._get_target_username()
+        if target_username:
+            logger.info(f"Resolving username: @{target_username}")
             try:
-                entity = await self.client.get_entity(self.config.target_username)
+                entity = await self.client.get_entity(target_username)
                 if isinstance(entity, User):
                     self.target_user_id = entity.id
-                    logger.info(f"✓ Resolved @{self.config.target_username} to user ID: {self.target_user_id}")
+                    # Save resolved ID to settings
+                    self.settings.set("target_user_id", self.target_user_id)
+                    logger.info(f"✓ Resolved @{target_username} to user ID: {self.target_user_id}")
                 else:
-                    logger.error(f"❌ @{self.config.target_username} is not a user")
+                    logger.error(f"❌ @{target_username} is not a user")
                     sys.exit(1)
             except Exception as e:
-                logger.error(f"❌ Failed to resolve @{self.config.target_username}: {e}")
+                logger.error(f"❌ Failed to resolve @{target_username}: {e}")
                 sys.exit(1)
     
     def is_quiet_hours(self) -> bool:
         """Check if current time is within quiet hours."""
-        if not self.config.quiet_hours_start or not self.config.quiet_hours_end:
+        quiet_start = self.settings.get_str("quiet_hours_start", "")
+        quiet_end = self.settings.get_str("quiet_hours_end", "")
+        
+        if not quiet_start or not quiet_end:
             return False
         
         try:
-            now = datetime.now(self.config.timezone)
+            tz = self.settings.get_timezone()
+            now = datetime.now(tz)
             current_time = now.time()
             
-            start_parts = self.config.quiet_hours_start.split(":")
-            end_parts = self.config.quiet_hours_end.split(":")
+            start_parts = quiet_start.split(":")
+            end_parts = quiet_end.split(":")
             
             start_time = dt_time(int(start_parts[0]), int(start_parts[1]))
             end_time = dt_time(int(end_parts[0]), int(end_parts[1]))
@@ -119,7 +147,8 @@ class WifeBot:
     async def generate_response(self, user_message: str) -> str:
         """Generate response using Gemini API."""
         # Get conversation context
-        context = self.db.get_context(self.config.context_turns)
+        context_turns = self.settings.get_int("context_turns", 40)
+        context = self.db.get_context(context_turns)
         
         # Build chat history for Gemini format
         history = []
@@ -165,17 +194,29 @@ class WifeBot:
         if not event.is_private:
             return
         
-        # Filter: ignore outgoing messages
-        if event.out:
-            return
-        
         # Get sender
         sender = await event.get_sender()
         if not isinstance(sender, User):
             return
         
+        chat_id = event.chat_id
+        message_id = event.id
+        
+        # Track last sender for /last_sender command
+        self.db.set_last_sender_id(sender.id)
+        
+        # Handle outgoing messages - manual override pause
+        if event.out:
+            # Check if this is a message to target user
+            current_target = self._get_target_user_id()
+            if sender.id == current_target or chat_id == current_target:
+                # User is manually typing to target - set auto-pause
+                self.settings.set_manual_override_pause()
+            return
+        
         # Filter: only target user
-        if sender.id != self.target_user_id:
+        current_target = self._get_target_user_id()
+        if sender.id != current_target:
             return
         
         # Filter: ignore empty messages (service messages, etc.)
@@ -183,21 +224,31 @@ class WifeBot:
         if not message_text:
             return
         
-        # Deduplication check
-        if self.db.is_message_processed(event.id):
-            logger.debug(f"Message {event.id} already processed, skipping")
+        # Deduplication check (chat_id + message_id)
+        if self.db.is_message_processed(chat_id, message_id):
+            logger.debug(f"Message {message_id} already processed, skipping")
             return
         
         logger.info(f"📨 Received: {message_text[:50]}{'...' if len(message_text) > 50 else ''}")
         
+        # Update last activity
+        self.db.set_last_activity_ts()
+        
+        # Check if should respond (AI enabled, not paused)
+        should_respond, reason = self.settings.should_respond()
+        if not should_respond:
+            logger.info(f"🚫 Skipping response: {reason}")
+            return
+        
         # Check quiet hours
         if self.is_quiet_hours():
-            if self.config.quiet_mode == "ignore":
+            quiet_mode = self.settings.get_str("quiet_mode", "queue")
+            if quiet_mode == "ignore":
                 logger.info("🌙 Quiet hours (ignore mode) - skipping message")
                 return
             else:  # queue mode
                 logger.info("🌙 Quiet hours (queue mode) - saving to pending")
-                self.db.add_pending_message(event.id, message_text)
+                self.db.add_pending_message(chat_id, message_id, message_text)
                 return
         
         # Rate limit check
@@ -208,7 +259,7 @@ class WifeBot:
             await self.rate_limiter.wait_and_acquire()
         
         # Save incoming message
-        self.db.add_message("user", message_text, event.id)
+        self.db.add_message("user", message_text, chat_id, message_id)
         
         # Generate and send response
         try:
@@ -218,7 +269,7 @@ class WifeBot:
             await self.send_message_with_typing(event.chat_id, response)
             
             # Save outgoing message
-            self.db.add_message("assistant", response)
+            self.db.add_message("assistant", response, chat_id)
             
         except Exception as e:
             logger.error(f"❌ Error processing message: {e}")
@@ -226,6 +277,12 @@ class WifeBot:
     async def process_pending_queue(self) -> None:
         """Process pending messages after quiet hours end."""
         if not self.db.has_pending_messages():
+            return
+        
+        # Check if should respond
+        should_respond, reason = self.settings.should_respond()
+        if not should_respond:
+            logger.info(f"🚫 Queue processing skipped: {reason}")
             return
         
         pending = self.db.get_pending_messages()
@@ -239,9 +296,12 @@ class WifeBot:
             await asyncio.sleep(wait_time)
             await self.rate_limiter.wait_and_acquire()
         
+        # Get chat_id from first pending message
+        chat_id = pending[0].get("chat_id", self._get_target_user_id())
+        
         # Save all pending messages to history
         for msg in pending:
-            self.db.add_message("user", msg["text"], msg["message_id"])
+            self.db.add_message("user", msg["text"], msg.get("chat_id"), msg["message_id"])
         
         # Format combined message
         combined_text = format_pending_messages(pending)
@@ -250,10 +310,10 @@ class WifeBot:
             response = await self.generate_response(combined_text)
             logger.info(f"💬 Queue response: {response[:50]}{'...' if len(response) > 50 else ''}")
             
-            await self.send_message_with_typing(self.target_user_id, response)
+            await self.send_message_with_typing(chat_id, response)
             
             # Save outgoing message
-            self.db.add_message("assistant", response)
+            self.db.add_message("assistant", response, chat_id)
             
             # Clear pending queue
             self.db.clear_pending_messages()
@@ -285,15 +345,27 @@ class WifeBot:
             await self.handle_message(event)
         
         # Start queue processor if queue mode enabled
-        if self.config.quiet_mode == "queue":
+        quiet_mode = self.settings.get_str("quiet_mode", "queue")
+        if quiet_mode == "queue":
             self._queue_processor_task = asyncio.create_task(self.queue_processor_loop())
             logger.info("✓ Queue processor started")
         
         # Log configuration
-        logger.info(f"📋 Config: model={self.config.model_name}, context_turns={self.config.context_turns}")
-        if self.config.quiet_hours_start and self.config.quiet_hours_end:
-            logger.info(f"🌙 Quiet hours: {self.config.quiet_hours_start} - {self.config.quiet_hours_end} ({self.config.quiet_mode} mode)")
-        logger.info(f"⏱️ Rate limit: {self.config.rate_limit_count} messages per {self.config.rate_limit_window_sec}s")
+        model_name = self.settings.get_str("model_name", self.config.model_name)
+        context_turns = self.settings.get_int("context_turns", 40)
+        logger.info(f"📋 Config: model={model_name}, context_turns={context_turns}")
+        
+        quiet_start = self.settings.get_str("quiet_hours_start", "")
+        quiet_end = self.settings.get_str("quiet_hours_end", "")
+        if quiet_start and quiet_end:
+            logger.info(f"🌙 Quiet hours: {quiet_start} - {quiet_end} ({quiet_mode} mode)")
+        
+        rate_count = self.settings.get_int("rate_limit_count", 4)
+        rate_window = self.settings.get_int("rate_limit_window", 30)
+        logger.info(f"⏱️ Rate limit: {rate_count} messages per {rate_window}s")
+        
+        ai_status = "ON" if self.settings.is_ai_enabled() else "OFF"
+        logger.info(f"🤖 AI: {ai_status}")
         
         logger.info("✅ Bot is running! Listening for messages...")
         
@@ -316,14 +388,49 @@ class WifeBot:
 async def main() -> None:
     """Main entry point."""
     config = get_config()
-    bot = WifeBot(config)
+    
+    # Initialize database
+    db = Database(config.db_path)
+    
+    # Initialize settings manager with ENV defaults
+    settings = SettingsManager(db, config.to_settings_dict())
+    
+    # Create wife bot
+    wife_bot = WifeBot(config, settings, db)
+    
+    # Create admin bot (returns Application or None)
+    admin_app = create_admin_bot(
+        token=config.admin_bot_token,
+        admin_user_ids=config.admin_user_ids,
+        settings=settings,
+        db=db,
+    )
     
     try:
-        await bot.start()
+        if admin_app:
+            # Run both bots - PTB in async mode (NOT run_polling!)
+            logger.info("🔧 Starting admin bot...")
+            await admin_app.initialize()
+            await admin_app.start()
+            await admin_app.updater.start_polling()
+            logger.info("✓ Admin bot started")
+            
+            try:
+                # Wife bot blocks until disconnected
+                await wife_bot.start()
+            finally:
+                # Cleanup admin bot
+                logger.info("Stopping admin bot...")
+                await admin_app.updater.stop()
+                await admin_app.stop()
+                await admin_app.shutdown()
+        else:
+            # Run only wife bot
+            await wife_bot.start()
     except KeyboardInterrupt:
         logger.info("Received interrupt signal")
     finally:
-        await bot.stop()
+        await wife_bot.stop()
 
 
 if __name__ == "__main__":

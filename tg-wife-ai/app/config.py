@@ -32,6 +32,7 @@ class Config:
     
     # Timezone and quiet hours
     timezone: ZoneInfo = field(default_factory=lambda: ZoneInfo("Europe/Moscow"))
+    timezone_name: str = "Europe/Moscow"  # String version for SettingsManager
     quiet_hours_start: Optional[str] = None  # "23:00"
     quiet_hours_end: Optional[str] = None    # "08:00"
     quiet_mode: str = "queue"  # "ignore" or "queue"
@@ -43,6 +44,10 @@ class Config:
     # Paths
     data_dir: str = "/app/data"
     
+    # Admin bot settings
+    admin_bot_token: Optional[str] = None
+    admin_user_ids: list[int] = field(default_factory=list)
+    
     @property
     def session_path(self) -> str:
         return os.path.join(self.data_dir, "telegram")
@@ -50,6 +55,24 @@ class Config:
     @property
     def db_path(self) -> str:
         return os.path.join(self.data_dir, "messages.db")
+    
+    def to_settings_dict(self) -> dict:
+        """Convert config to dict for SettingsManager initialization."""
+        return {
+            "ai_enabled": "true",
+            "pause_until_ts": "0",
+            "target_user_id": str(self.target_user_id) if self.target_user_id else "",
+            "target_username": self.target_username or "",
+            "quiet_hours_start": self.quiet_hours_start or "",
+            "quiet_hours_end": self.quiet_hours_end or "",
+            "timezone": self.timezone_name,
+            "quiet_mode": self.quiet_mode,
+            "context_turns": str(self.context_turns),
+            "rate_limit_count": str(self.rate_limit_count),
+            "rate_limit_window": str(self.rate_limit_window_sec),
+            "model_name": self.model_name,
+            "style_profile": self.style_profile,
+        }
 
 
 def _get_env(key: str, required: bool = False, default: Optional[str] = None) -> Optional[str]:
@@ -71,6 +94,22 @@ def _get_int_env(key: str, default: int) -> int:
     except ValueError:
         print(f"❌ Error: {key} must be an integer, got: {value}", file=sys.stderr)
         sys.exit(1)
+
+
+def _parse_admin_user_ids(value: Optional[str]) -> list[int]:
+    """Parse comma-separated list of admin user IDs."""
+    if not value:
+        return []
+    
+    ids = []
+    for part in value.split(","):
+        part = part.strip()
+        if part:
+            try:
+                ids.append(int(part))
+            except ValueError:
+                print(f"⚠️ Warning: Invalid admin user ID: {part}", file=sys.stderr)
+    return ids
 
 
 def load_config() -> Config:
@@ -120,6 +159,10 @@ def load_config() -> Config:
     # Style profile (can be multiline)
     style_profile = _get_env("STYLE_PROFILE", default="")
     
+    # Admin bot settings
+    admin_bot_token = _get_env("ADMIN_BOT_TOKEN")
+    admin_user_ids = _parse_admin_user_ids(_get_env("ADMIN_USER_IDS"))
+    
     config = Config(
         tg_api_id=tg_api_id,
         tg_api_hash=tg_api_hash,
@@ -130,12 +173,15 @@ def load_config() -> Config:
         style_profile=style_profile,
         context_turns=_get_int_env("CONTEXT_TURNS", 40),
         timezone=timezone,
+        timezone_name=tz_name,
         quiet_hours_start=_get_env("QUIET_HOURS_START"),
         quiet_hours_end=_get_env("QUIET_HOURS_END"),
         quiet_mode=quiet_mode,
         rate_limit_count=_get_int_env("RATE_LIMIT_COUNT", 4),
         rate_limit_window_sec=_get_int_env("RATE_LIMIT_WINDOW_SEC", 30),
         data_dir=_get_env("DATA_DIR", default="/app/data"),
+        admin_bot_token=admin_bot_token,
+        admin_user_ids=admin_user_ids,
     )
     
     return config

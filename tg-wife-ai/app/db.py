@@ -1,11 +1,12 @@
 """
-Database module for storing message history and pending messages.
+Database module for storing message history, pending messages, and settings.
 Uses SQLite for persistent storage.
 """
 
 import sqlite3
+import time
 from datetime import datetime
-from typing import Optional
+from typing import Optional, Any
 from contextlib import contextmanager
 
 
@@ -30,12 +31,13 @@ class Database:
         with self._get_conn() as conn:
             cursor = conn.cursor()
             
-            # Message history table
+            # Message history table (with chat_id for proper dedup)
             cursor.execute("""
                 CREATE TABLE IF NOT EXISTS messages (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     role TEXT NOT NULL,
                     text TEXT NOT NULL,
+                    chat_id INTEGER,
                     message_id INTEGER,
                     timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
                 )
@@ -45,9 +47,11 @@ class Database:
             cursor.execute("""
                 CREATE TABLE IF NOT EXISTS pending_incoming (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    message_id INTEGER NOT NULL UNIQUE,
+                    chat_id INTEGER NOT NULL,
+                    message_id INTEGER NOT NULL,
                     text TEXT NOT NULL,
-                    timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
+                    timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
+                    UNIQUE(chat_id, message_id)
                 )
             """)
             
@@ -58,14 +62,39 @@ class Database:
                     value TEXT
                 )
             """)
+            
+            # Settings table for runtime configuration
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS settings (
+                    key TEXT PRIMARY KEY,
+                    value TEXT NOT NULL,
+                    updated_ts INTEGER DEFAULT (strftime('%s', 'now'))
+                )
+            """)
+            
+            # Migration: add chat_id column if missing (for existing DBs)
+            cursor.execute("PRAGMA table_info(messages)")
+            columns = [row[1] for row in cursor.fetchall()]
+            if "chat_id" not in columns:
+                cursor.execute("ALTER TABLE messages ADD COLUMN chat_id INTEGER")
+            
+            # Migration: add chat_id to pending_incoming if missing
+            cursor.execute("PRAGMA table_info(pending_incoming)")
+            columns = [row[1] for row in cursor.fetchall()]
+            if "chat_id" not in columns:
+                cursor.execute("ALTER TABLE pending_incoming ADD COLUMN chat_id INTEGER DEFAULT 0")
     
-    def add_message(self, role: str, text: str, message_id: Optional[int] = None) -> None:
+    # ========================
+    # Message History Methods
+    # ========================
+    
+    def add_message(self, role: str, text: str, chat_id: Optional[int] = None, message_id: Optional[int] = None) -> None:
         """Add a message to history."""
         with self._get_conn() as conn:
             cursor = conn.cursor()
             cursor.execute(
-                "INSERT INTO messages (role, text, message_id) VALUES (?, ?, ?)",
-                (role, text, message_id)
+                "INSERT INTO messages (role, text, chat_id, message_id) VALUES (?, ?, ?, ?)",
+                (role, text, chat_id, message_id)
             )
     
     def get_context(self, limit: int) -> list[dict]:
@@ -86,24 +115,28 @@ class Database:
                 for row in reversed(rows)
             ]
     
-    def is_message_processed(self, message_id: int) -> bool:
-        """Check if a message has already been processed (deduplication)."""
+    def is_message_processed(self, chat_id: int, message_id: int) -> bool:
+        """Check if a message has already been processed (deduplication by chat_id + message_id)."""
         with self._get_conn() as conn:
             cursor = conn.cursor()
             cursor.execute(
-                "SELECT 1 FROM messages WHERE message_id = ? AND role = 'user' LIMIT 1",
-                (message_id,)
+                "SELECT 1 FROM messages WHERE chat_id = ? AND message_id = ? AND role = 'user' LIMIT 1",
+                (chat_id, message_id)
             )
             return cursor.fetchone() is not None
     
-    def add_pending_message(self, message_id: int, text: str) -> None:
+    # ========================
+    # Pending Queue Methods
+    # ========================
+    
+    def add_pending_message(self, chat_id: int, message_id: int, text: str) -> None:
         """Add a message to pending queue (quiet hours)."""
         with self._get_conn() as conn:
             cursor = conn.cursor()
             try:
                 cursor.execute(
-                    "INSERT INTO pending_incoming (message_id, text) VALUES (?, ?)",
-                    (message_id, text)
+                    "INSERT INTO pending_incoming (chat_id, message_id, text) VALUES (?, ?, ?)",
+                    (chat_id, message_id, text)
                 )
             except sqlite3.IntegrityError:
                 # Already exists, ignore
@@ -114,7 +147,7 @@ class Database:
         with self._get_conn() as conn:
             cursor = conn.cursor()
             cursor.execute("""
-                SELECT message_id, text, timestamp 
+                SELECT chat_id, message_id, text, timestamp 
                 FROM pending_incoming 
                 ORDER BY id ASC
             """)
@@ -139,3 +172,78 @@ class Database:
             cursor = conn.cursor()
             cursor.execute("SELECT COUNT(*) FROM pending_incoming")
             return cursor.fetchone()[0]
+    
+    # ========================
+    # Settings Methods
+    # ========================
+    
+    def get_setting(self, key: str, default: Optional[str] = None) -> Optional[str]:
+        """Get a setting value from database."""
+        with self._get_conn() as conn:
+            cursor = conn.cursor()
+            cursor.execute("SELECT value FROM settings WHERE key = ?", (key,))
+            row = cursor.fetchone()
+            return row[0] if row else default
+    
+    def set_setting(self, key: str, value: str) -> None:
+        """Set a setting value in database."""
+        with self._get_conn() as conn:
+            cursor = conn.cursor()
+            cursor.execute("""
+                INSERT INTO settings (key, value, updated_ts) 
+                VALUES (?, ?, ?)
+                ON CONFLICT(key) DO UPDATE SET value = ?, updated_ts = ?
+            """, (key, value, int(time.time()), value, int(time.time())))
+    
+    def get_all_settings(self) -> dict[str, str]:
+        """Get all settings as a dictionary."""
+        with self._get_conn() as conn:
+            cursor = conn.cursor()
+            cursor.execute("SELECT key, value FROM settings")
+            return {row["key"]: row["value"] for row in cursor.fetchall()}
+    
+    def delete_setting(self, key: str) -> None:
+        """Delete a setting from database."""
+        with self._get_conn() as conn:
+            cursor = conn.cursor()
+            cursor.execute("DELETE FROM settings WHERE key = ?", (key,))
+    
+    # ========================
+    # State Methods
+    # ========================
+    
+    def get_last_sender_id(self) -> Optional[int]:
+        """Get the last incoming message sender ID."""
+        with self._get_conn() as conn:
+            cursor = conn.cursor()
+            cursor.execute("SELECT value FROM state WHERE key = 'last_sender_id'")
+            row = cursor.fetchone()
+            return int(row[0]) if row else None
+    
+    def set_last_sender_id(self, sender_id: int) -> None:
+        """Set the last incoming message sender ID."""
+        with self._get_conn() as conn:
+            cursor = conn.cursor()
+            cursor.execute("""
+                INSERT INTO state (key, value) VALUES ('last_sender_id', ?)
+                ON CONFLICT(key) DO UPDATE SET value = ?
+            """, (str(sender_id), str(sender_id)))
+    
+    def get_last_activity_ts(self) -> Optional[int]:
+        """Get timestamp of last activity."""
+        with self._get_conn() as conn:
+            cursor = conn.cursor()
+            cursor.execute("SELECT value FROM state WHERE key = 'last_activity_ts'")
+            row = cursor.fetchone()
+            return int(row[0]) if row else None
+    
+    def set_last_activity_ts(self, ts: Optional[int] = None) -> None:
+        """Set timestamp of last activity."""
+        if ts is None:
+            ts = int(time.time())
+        with self._get_conn() as conn:
+            cursor = conn.cursor()
+            cursor.execute("""
+                INSERT INTO state (key, value) VALUES ('last_activity_ts', ?)
+                ON CONFLICT(key) DO UPDATE SET value = ?
+            """, (str(ts), str(ts)))
