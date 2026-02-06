@@ -117,10 +117,10 @@ class TelethonManager:
     # Auth Flow (for onboarding)
     # ========================
     
-    async def send_code(self, user: UserData) -> tuple[bool, str, Optional[str]]:
+    async def send_code(self, user: UserData) -> tuple[bool, str, Optional[str], Optional[str]]:
         """
         Send authentication code.
-        Returns: (success, message, phone_code_hash)
+        Returns: (success, message, phone_code_hash, session_string)
         """
         try:
             client = TelegramClient(
@@ -132,27 +132,25 @@ class TelethonManager:
             
             result = await client.send_code_request(user.phone)
             
-            # Save session for later
-            user.session_string = client.session.save()
-            user.phone_code_hash = result.phone_code_hash
-            self.db.save_user(user)
+            # Return session for later use (don't disconnect yet, but save session)
+            session_string = client.session.save()
             
             await client.disconnect()
             
-            return True, "Код отправлен", result.phone_code_hash
+            return True, "Код отправлен", result.phone_code_hash, session_string
             
         except Exception as e:
             logger.error(f"Send code error: {e}")
-            return False, f"Ошибка: {e}", None
+            return False, f"Ошибка: {e}", None, None
     
-    async def sign_in(self, user: UserData, code: str) -> tuple[bool, str, bool]:
+    async def sign_in(self, user: UserData, code: str, phone_code_hash: str, session_string: str) -> tuple[bool, str, bool, Optional[str]]:
         """
         Sign in with code.
-        Returns: (success, message, needs_2fa)
+        Returns: (success, message, needs_2fa, new_session_string)
         """
         try:
             client = TelegramClient(
-                StringSession(user.session_string),
+                StringSession(session_string),
                 user.api_id,
                 user.api_hash,
             )
@@ -162,32 +160,32 @@ class TelethonManager:
                 await client.sign_in(
                     user.phone,
                     code,
-                    phone_code_hash=user.phone_code_hash
+                    phone_code_hash=phone_code_hash
                 )
                 
                 # Save updated session
-                user.session_string = client.session.save()
+                new_session = client.session.save()
+                user.session_string = new_session
                 self.db.save_user(user)
                 
                 await client.disconnect()
-                return True, "Авторизация успешна!", False
+                return True, "Авторизация успешна!", False, new_session
                 
             except SessionPasswordNeededError:
-                # 2FA required
-                user.session_string = client.session.save()
-                self.db.save_user(user)
+                # 2FA required - return session for next step
+                new_session = client.session.save()
                 await client.disconnect()
-                return False, "Требуется 2FA пароль", True
+                return False, "Требуется 2FA пароль", True, new_session
                 
         except Exception as e:
             logger.error(f"Sign in error: {e}")
-            return False, f"Ошибка: {e}", False
+            return False, f"Ошибка: {e}", False, None
     
-    async def sign_in_2fa(self, user: UserData, password: str) -> tuple[bool, str]:
+    async def sign_in_2fa(self, user: UserData, password: str, session_string: str) -> tuple[bool, str]:
         """Sign in with 2FA password."""
         try:
             client = TelegramClient(
-                StringSession(user.session_string),
+                StringSession(session_string),
                 user.api_id,
                 user.api_hash,
             )

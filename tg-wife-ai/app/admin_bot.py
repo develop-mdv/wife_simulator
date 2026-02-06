@@ -284,16 +284,21 @@ class AdminBot:
         )
         
         # Trigger Telethon send_code
-        success, msg, phone_code_hash = await self.tm.send_code(user)
+        success, msg, phone_code_hash, session_string = await self.tm.send_code(user)
         
         if not success:
             await update.message.reply_text(f"❌ Ошибка отправки кода: {msg}\nПроверь данные и начни заново: /start")
             return ConversationHandler.END
+        
+        # Store auth data in context (persists across handlers)
+        context.user_data['phone_code_hash'] = phone_code_hash
+        context.user_data['session_string'] = session_string
             
         await update.message.reply_text(
             "📩 **Код отправлен!**\n"
             "Он придет в Telegram (на твоем устройстве).\n\n"
-            "👇 Введи код сюда (например: 12345):"
+            "👇 Введи код сюда (например: 12345):",
+            parse_mode="Markdown"
         )
         return STATE_ONBOARDING_CODE
 
@@ -303,12 +308,27 @@ class AdminBot:
         
         await update.message.reply_text("🔄 Проверяю код...")
         
-        success, msg, needs_2fa = await self.tm.sign_in(user, code)
+        # Get auth data from context
+        phone_code_hash = context.user_data.get('phone_code_hash')
+        session_string = context.user_data.get('session_string')
+        
+        if not phone_code_hash or not session_string:
+            await update.message.reply_text("❌ Сессия устарела. Начни заново: /start")
+            return ConversationHandler.END
+        
+        success, msg, needs_2fa, new_session = await self.tm.sign_in(
+            user, code, phone_code_hash, session_string
+        )
+        
+        # Update session in context for 2FA step
+        if new_session:
+            context.user_data['session_string'] = new_session
         
         if needs_2fa:
             await update.message.reply_text(
                 "🔐 **Требуется облачный пароль (2FA).**\n"
-                "👇 Введи свой пароль от двухэтапной аутентификации:"
+                "👇 Введи свой пароль от двухэтапной аутентификации:",
+                parse_mode="Markdown"
             )
             return STATE_ONBOARDING_2FA
             
@@ -317,7 +337,7 @@ class AdminBot:
             return STATE_ONBOARDING_CODE
         
         # Auth success
-        await self._ask_for_target(update)
+        await self._ask_for_target(update, context)
         return STATE_ONBOARDING_TARGET
 
     async def _handle_2fa(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
@@ -326,16 +346,21 @@ class AdminBot:
         
         await update.message.reply_text("🔄 Проверяю пароль...")
         
-        success, msg = await self.tm.sign_in_2fa(user, password)
+        session_string = context.user_data.get('session_string')
+        if not session_string:
+            await update.message.reply_text("❌ Сессия устарела. Начни заново: /start")
+            return ConversationHandler.END
+        
+        success, msg = await self.tm.sign_in_2fa(user, password, session_string)
         
         if not success:
             await update.message.reply_text(f"❌ Ошибка: {msg}\nПопробуй еще раз:")
             return STATE_ONBOARDING_2FA
             
-        await self._ask_for_target(update)
+        await self._ask_for_target(update, context)
         return STATE_ONBOARDING_TARGET
 
-    async def _ask_for_target(self, update: Update) -> None:
+    async def _ask_for_target(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         """Helper to ask for target user."""
         markup = ReplyKeyboardMarkup(
             [[KeyboardButton(text="👤 Выбрать контакт из списка", request_contact=True)]],
@@ -351,8 +376,12 @@ class AdminBot:
             parse_mode="Markdown"
         )
         
-        # Start client in background to be ready for resolving
+        # Start client with the session we obtained during auth
         user = self._get_user(update.effective_user)
+        session_string = context.user_data.get('session_string')
+        if session_string:
+            user.session_string = session_string
+            self.db.save_user(user)
         await self.tm.start_client_for_user(user)
 
     async def _handle_target(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
