@@ -3,13 +3,15 @@ Admin Bot with Multi-User Support and Onboarding Flow.
 Uses python-telegram-bot v21+ with ConversationHandler.
 """
 
+import os
 import re
 import time
 import logging
+from pathlib import Path
 from typing import Optional
 from zoneinfo import ZoneInfo
 
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup, ReplyKeyboardRemove, KeyboardButton
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup, ReplyKeyboardRemove, KeyboardButton, KeyboardButtonRequestUsers, InputMediaPhoto
 from telegram.ext import (
     Application,
     CommandHandler,
@@ -62,21 +64,27 @@ class AdminBot:
                 STATE_ONBOARDING_PHONE: [MessageHandler(filters.TEXT | filters.CONTACT, self._handle_phone)],
                 STATE_ONBOARDING_CODE: [MessageHandler(filters.TEXT & ~filters.COMMAND, self._handle_code)],
                 STATE_ONBOARDING_2FA: [MessageHandler(filters.TEXT & ~filters.COMMAND, self._handle_2fa)],
-                STATE_ONBOARDING_TARGET: [MessageHandler(filters.TEXT | filters.CONTACT, self._handle_target)],
+                STATE_ONBOARDING_TARGET: [
+                    MessageHandler(filters.StatusUpdate.USERS_SHARED, self._handle_user_shared),
+                    MessageHandler(filters.TEXT & ~filters.COMMAND, self._handle_target)
+                ],
                 
                 STATE_MAIN_MENU: [
                     CallbackQueryHandler(self._menu_callback),
                     MessageHandler(filters.TEXT & ~filters.COMMAND, self._unknown_text)
                 ],
                 
-                STATE_SETTINGS_INPUT: [MessageHandler(filters.TEXT & ~filters.COMMAND, self._handle_setting_input)],
+                STATE_SETTINGS_INPUT: [
+                    CallbackQueryHandler(self._settings_callback),
+                    MessageHandler(filters.StatusUpdate.USERS_SHARED, self._handle_target_change_shared),
+                    MessageHandler(filters.TEXT & ~filters.COMMAND, self._handle_setting_input)
+                ],
             },
             fallbacks=[
                 CommandHandler("start", self._cmd_start),
                 CommandHandler("cancel", self._cmd_cancel),
-                CallbackQueryHandler(self._global_back_handler, pattern="^back_to_.*"),
-                CallbackQueryHandler(self._cancel_handler, pattern="^cancel$")
-            ]
+            ],
+            per_message=False
         )
         
         self.app.add_handler(onboarding_handler)
@@ -181,13 +189,20 @@ class AdminBot:
         await update.callback_query.message.reply_text("❌ Настройка отменена.", reply_markup=ReplyKeyboardRemove())
         return ConversationHandler.END
         
-    async def _global_back_handler(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-        """Handle 'Back' buttons globally."""
+    async def _settings_callback(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+        """Handle callbacks in settings input state."""
         query = update.callback_query
         await query.answer()
-        # This is complex to route generically. For now, specific step handlers will handle backs or resets.
-        # Implemented specific back logic in steps.
-        return ConversationHandler.END
+        data = query.data
+        user = self._get_user(update.effective_user)
+        
+        if data == "back_to_settings":
+            user.pending_setting = None
+            self.db.save_user(user)
+            await self._send_settings_menu(update, user, edit=True)
+            return STATE_MAIN_MENU
+        
+        return STATE_SETTINGS_INPUT
 
     # ========================
     # Onboarding Steps
@@ -215,19 +230,38 @@ class AdminBot:
             await self._send_main_menu(update, user)
             return STATE_MAIN_MENU
 
+        # Get assets path (relative to this file)
+        assets_dir = Path(__file__).parent / "assets"
+        
+        # Send instruction images if they exist
+        images = [
+            ("tg_phone.png", "📱 Введи номер телефона"),
+            ("Confirmation code.png", "🔐 Введи код из Telegram"),
+            ("Your Telegram Core.png", "👉 Нажми API development tools"),
+            ("api_id_api_hash.png", "📋 Скопируй api_id и api_hash"),
+        ]
+        
+        media_group = []
+        for filename, caption in images:
+            img_path = assets_dir / filename
+            if img_path.exists():
+                media_group.append(InputMediaPhoto(media=open(img_path, 'rb'), caption=caption))
+        
+        if media_group:
+            try:
+                await update.message.reply_media_group(media_group)
+            except Exception as e:
+                logger.warning(f"Could not send instruction images: {e}")
+
         await update.message.reply_text(
             "👋 **Привет! Настроим твоего AI-ассистента.**\n\n"
             "**Шаг 1 из 4: Telegram API**\n"
-            "Для работы нужны API ID и API Hash.\n"
-            "Это официальный метод Telegram.\n\n"
-            "📖 **Как получить:**\n"
+            "Для работы нужны API ID и API Hash.\n\n"
+            "📖 **Как получить** (см. картинки выше):\n"
             "1️⃣ Открой https://my.telegram.org\n"
             "2️⃣ Введи номер телефона → получи код в Telegram\n"
             "3️⃣ Нажми **«API development tools»**\n"
-            "4️⃣ Заполни форму:\n"
-            "   • App title: `WifeAI`\n"
-            "   • Short name: `wifeai`\n"
-            "   • Platform: любая\n"
+            "4️⃣ Заполни форму (App title: `WifeAI`)\n"
             "5️⃣ Скопируй **App api_id** (числа)\n\n"
             "👇 **Введи api_id:**",
             parse_mode="Markdown"
@@ -364,17 +398,24 @@ class AdminBot:
         return STATE_ONBOARDING_TARGET
 
     async def _ask_for_target(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-        """Helper to ask for target user."""
+        """Helper to ask for target user using Telegram's user picker."""
+        # Use KeyboardButtonRequestUsers for user picker
+        user_picker = KeyboardButtonRequestUsers(
+            request_id=1,  # Unique ID to identify this request
+            user_is_bot=False,
+            max_quantity=1
+        )
         markup = ReplyKeyboardMarkup(
-            [[KeyboardButton(text="👤 Выбрать контакт из списка", request_contact=True)]],
+            [[KeyboardButton(text="👤 Выбрать пользователя", request_users=user_picker)]],
             one_time_keyboard=True,
             resize_keyboard=True
         )
         await update.message.reply_text(
             "✅ **Авторизация успешна!**\n\n"
             "**Шаг 3 из 4: Выбор цели**\n"
-            "Кому я должен отвечать? Это может быть только один человек (муж/жена).\n\n"
-            "👇 **Отправь контакт этого человека** (скрепка -> Контакт) или напиши его @username:",
+            "Кому я должен отвечать?\n\n"
+            "👇 **Нажми кнопку и выбери человека из списка:**\n"
+            "_(или напиши @username вручную)_",
             reply_markup=markup,
             parse_mode="Markdown"
         )
@@ -387,37 +428,67 @@ class AdminBot:
             self.db.save_user(user)
         await self.tm.start_client_for_user(user)
 
-    async def _handle_target(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    async def _handle_user_shared(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+        """Handle user selection from Telegram's user picker."""
         user = self._get_user(update.effective_user)
         
-        target_id = None
-        target_name = None
-        target_username = None
+        users_shared = update.message.users_shared
+        if not users_shared or not users_shared.users:
+            await update.message.reply_text("❌ Ошибка выбора. Попробуй ещё раз:")
+            return STATE_ONBOARDING_TARGET
         
-        if update.message.contact:
-            c = update.message.contact
-            target_id = c.user_id
-            target_name = f"{c.first_name} {c.last_name or ''}".strip()
-            
-            # Note: sharing contact doesn't guarantee access if user blocked us or privacy, 
-            # but usually gives ID. Telethon client needs to resolve it to get access hash often.
-        else:
-            # Username input
-            username = update.message.text.strip()
-            if username.startswith("@"):
-                username = username[1:]
-            
-            await update.message.reply_text("🔄 Ищу пользователя...")
-            
-            # Use Telethon to resolve
-            success, tid, tname = await self.tm.resolve_username(user, username)
-            if not success:
-                await update.message.reply_text(f"❌ Не могу найти пользователя @{username}. Проверь имя или отправь контакт.")
-                return STATE_ONBOARDING_TARGET
-            
-            target_id = tid
-            target_name = tname
-            target_username = username
+        shared_user = users_shared.users[0]
+        target_id = shared_user.user_id
+        
+        # Try to get name via Telethon
+        target_name = None
+        try:
+            client = self.tm.get_client(user.user_id)
+            if client:
+                entity = await client.get_entity(target_id)
+                target_name = f"{entity.first_name or ''} {entity.last_name or ''}".strip()
+        except Exception as e:
+            logger.warning(f"Could not resolve user {target_id}: {e}")
+            target_name = f"User {target_id}"
+        
+        # Save target
+        user.target_user_id = target_id
+        user.target_username = None
+        user.target_name = target_name or f"User {target_id}"
+        user.state = UserState.READY
+        self.db.save_user(user)
+        
+        await update.message.reply_text(
+            "🎉 **Настройка завершена!**\n\n"
+            f"Теперь я буду помогать общаться с: **{user.target_name}**\n"
+            "По умолчанию AI-ответы **выключены**, чтобы ты мог(ла) проверить настройки.",
+            reply_markup=ReplyKeyboardRemove(),
+            parse_mode="Markdown"
+        )
+        
+        await self._send_main_menu(update, user)
+        return STATE_MAIN_MENU
+
+    async def _handle_target(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+        """Handle manual username input for target."""
+        user = self._get_user(update.effective_user)
+        
+        # Username input
+        username = update.message.text.strip()
+        if username.startswith("@"):
+            username = username[1:]
+        
+        await update.message.reply_text("🔄 Ищу пользователя...", reply_markup=ReplyKeyboardRemove())
+        
+        # Use Telethon to resolve
+        success, tid, tname = await self.tm.resolve_username(user, username)
+        if not success:
+            await update.message.reply_text(f"❌ Не могу найти @{username}. Попробуй выбрать через кнопку.")
+            return STATE_ONBOARDING_TARGET
+        
+        target_id = tid
+        target_name = tname
+        target_username = username
             
         if not target_id:
              await update.message.reply_text(f"❌ Не удалось определить ID пользователя. Попробуйте отправить контакт.")
@@ -533,14 +604,30 @@ class AdminBot:
         user.pending_setting = setting
         self.db.save_user(user)
         
+        if setting == "target":
+            # Use user picker for target change
+            user_picker = KeyboardButtonRequestUsers(
+                request_id=2,  # Different ID for settings
+                user_is_bot=False,
+                max_quantity=1
+            )
+            reply_kb = ReplyKeyboardMarkup(
+                [[KeyboardButton(text="👤 Выбрать пользователя", request_users=user_picker)]],
+                one_time_keyboard=True,
+                resize_keyboard=True
+            )
+            await update.callback_query.message.reply_text(
+                "🎯 **Смена цели**\n\n"
+                "👇 Нажми кнопку и выбери нового человека:\n"
+                "_(или напиши @username вручную)_",
+                reply_markup=reply_kb,
+                parse_mode="Markdown"
+            )
+            return STATE_SETTINGS_INPUT
+        
         back_kb = InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Отмена", callback_data="back_to_settings")]])
         
-        if setting == "target":
-            text = (
-                "🎯 **Смена цели**\n\n"
-                "Введите @username нового человека, или перешлите мне любое его сообщение:"
-            )
-        elif setting == "timezone":
+        if setting == "timezone":
             text = "🌍 Введите часовой пояс (например, `Europe/Moscow`):"
         elif setting == "quiet":
             text = "🌙 Введите тихие часы в формате `Start-End` (например, `23:00-08:00`), или `off` чтобы выключить:"
@@ -605,6 +692,44 @@ class AdminBot:
         await self._send_main_menu(update, user)
         return STATE_MAIN_MENU
 
+    async def _handle_target_change_shared(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+        """Handle user picker selection when changing target from settings."""
+        user = self._get_user(update.effective_user)
+        
+        users_shared = update.message.users_shared
+        if not users_shared or not users_shared.users:
+            await update.message.reply_text("❌ Ошибка выбора. Попробуй ещё раз:")
+            return STATE_SETTINGS_INPUT
+        
+        shared_user = users_shared.users[0]
+        target_id = shared_user.user_id
+        
+        # Try to get name via Telethon
+        target_name = None
+        try:
+            client = self.tm.get_client(user.user_id)
+            if client:
+                entity = await client.get_entity(target_id)
+                target_name = f"{entity.first_name or ''} {entity.last_name or ''}".strip()
+        except Exception as e:
+            logger.warning(f"Could not resolve user {target_id}: {e}")
+            target_name = f"User {target_id}"
+        
+        # Save target
+        user.target_user_id = target_id
+        user.target_username = None
+        user.target_name = target_name or f"User {target_id}"
+        user.pending_setting = None
+        self.db.save_user(user)
+        
+        await update.message.reply_text(
+            f"✅ Цель изменена на **{user.target_name}**",
+            reply_markup=ReplyKeyboardRemove(),
+            parse_mode="Markdown"
+        )
+        
+        await self._send_main_menu(update, user)
+        return STATE_MAIN_MENU
 
 def create_admin_bot(token: str, db: Database, tm: TelethonManager) -> Application:
     """Create and configure admin bot."""
