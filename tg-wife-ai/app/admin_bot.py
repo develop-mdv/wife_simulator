@@ -115,8 +115,8 @@ class AdminBot:
                 InlineKeyboardButton("🛑 Выключить AI", callback_data="toggle_off")
             ],
             [
-                InlineKeyboardButton("⏸ 30м", callback_data="pause_30m"),
-                InlineKeyboardButton("⏸ 2ч", callback_data="pause_2h"),
+                InlineKeyboardButton("⏸ 15м", callback_data="pause_15m"),
+                InlineKeyboardButton("⏸ 1ч", callback_data="pause_1h"),
                 InlineKeyboardButton("▶️ Снять паузу", callback_data="resume")
             ],
             [
@@ -218,15 +218,18 @@ class AdminBot:
         await update.message.reply_text(
             "👋 **Привет! Настроим твоего AI-ассистента.**\n\n"
             "**Шаг 1 из 4: Telegram API**\n"
-            "Для работы мне нужны API ID и API Hash от твоего аккаунта.\n"
-            "Это официальный метод Telegram для сторонних клиентов.\n\n"
-            "📖 **Инструкция:**\n"
-            "1. Открой my.telegram.org\n"
-            "2. Войди по номеру телефона\n"
-            "3. Перейди в 'API development tools'\n"
-            "4. Создай приложение (App title: WifeAI, Short name: wifeai)\n"
-            "5. Скопируй **App api_id**\n\n"
-            "👇 **Введи сейчас api_id (только цифры):**",
+            "Для работы нужны API ID и API Hash.\n"
+            "Это официальный метод Telegram.\n\n"
+            "📖 **Как получить:**\n"
+            "1️⃣ Открой https://my.telegram.org\n"
+            "2️⃣ Введи номер телефона → получи код в Telegram\n"
+            "3️⃣ Нажми **«API development tools»**\n"
+            "4️⃣ Заполни форму:\n"
+            "   • App title: `WifeAI`\n"
+            "   • Short name: `wifeai`\n"
+            "   • Platform: любая\n"
+            "5️⃣ Скопируй **App api_id** (числа)\n\n"
+            "👇 **Введи api_id:**",
             parse_mode="Markdown"
         )
         return STATE_ONBOARDING_API_ID
@@ -462,8 +465,8 @@ class AdminBot:
             parts = data.split("_")
             duration = parts[1]
             seconds = 0
-            if duration == "30m": seconds = 30*60
-            elif duration == "2h": seconds = 2*60*60
+            if duration == "15m": seconds = 15*60
+            elif duration == "1h": seconds = 60*60
             
             user.pause_until_ts = int(time.time()) + seconds
             self.db.save_user(user)
@@ -486,6 +489,12 @@ class AdminBot:
         elif data == "back_to_main":
             await self._send_main_menu(update, user, edit=True)
             return STATE_MAIN_MENU
+        
+        elif data == "back_to_settings":
+            user.pending_setting = None
+            self.db.save_user(user)
+            await self._send_settings_menu(update, user, edit=True)
+            return STATE_MAIN_MENU
             
         return STATE_MAIN_MENU
 
@@ -502,10 +511,12 @@ class AdminBot:
 
     async def _send_settings_menu(self, update: Update, user: UserData, edit: bool = False) -> None:
         """Send settings menu."""
+        target_display = user.target_name or user.target_username or str(user.target_user_id)
         kb = [
-            [InlineKeyboardButton(f"Часовой пояс: {user.timezone}", callback_data="set_timezone")],
-            [InlineKeyboardButton(f"Тихие часы: {user.quiet_hours_start or 'Выкл'}", callback_data="set_quiet")],
-            [InlineKeyboardButton(f"Профиль стиля", callback_data="set_style")],
+            [InlineKeyboardButton(f"🎯 Цель: {target_display}", callback_data="set_target")],
+            [InlineKeyboardButton(f"🌍 Часовой пояс: {user.timezone}", callback_data="set_timezone")],
+            [InlineKeyboardButton(f"🌙 Тихие часы: {user.quiet_hours_start or 'Выкл'}", callback_data="set_quiet")],
+            [InlineKeyboardButton("🎨 Профиль стиля", callback_data="set_style")],
             [InlineKeyboardButton("⬅️ Назад", callback_data="back_to_main")]
         ]
         text = "⚙️ **Настройки**\nВыберите, что хотите изменить:"
@@ -522,17 +533,24 @@ class AdminBot:
         user.pending_setting = setting
         self.db.save_user(user)
         
-        if setting == "timezone":
+        back_kb = InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Отмена", callback_data="back_to_settings")]])
+        
+        if setting == "target":
+            text = (
+                "🎯 **Смена цели**\n\n"
+                "Введите @username нового человека, или перешлите мне любое его сообщение:"
+            )
+        elif setting == "timezone":
             text = "🌍 Введите часовой пояс (например, `Europe/Moscow`):"
         elif setting == "quiet":
             text = "🌙 Введите тихие часы в формате `Start-End` (например, `23:00-08:00`), или `off` чтобы выключить:"
         elif setting == "style":
             current = user.style_profile or "Стандартный"
-            text = f"🎨 **Текущий стиль:**\n{current}\n\n👇 Отправьте новый текст описания стиля (или /cancel):"
+            text = f"🎨 **Текущий стиль:**\n{current}\n\n👇 Отправьте новый текст описания стиля:"
         else:
             text = "Введите значение:"
             
-        await update.callback_query.message.reply_text(text, parse_mode="Markdown")
+        await update.callback_query.message.reply_text(text, reply_markup=back_kb, parse_mode="Markdown")
         return STATE_SETTINGS_INPUT
 
     async def _handle_setting_input(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
@@ -540,7 +558,20 @@ class AdminBot:
         setting = user.pending_setting
         value = update.message.text.strip()
         
-        if setting == "timezone":
+        if setting == "target":
+            # Handle target change via username
+            username = value.lstrip("@")
+            await update.message.reply_text("🔄 Ищу пользователя...")
+            success, tid, tname = await self.tm.resolve_username(user, username)
+            if not success:
+                await update.message.reply_text(f"❌ Не могу найти @{username}. Проверь имя:")
+                return STATE_SETTINGS_INPUT
+            user.target_user_id = tid
+            user.target_username = username
+            user.target_name = tname
+            await update.message.reply_text(f"✅ Цель изменена на **{tname}**", parse_mode="Markdown")
+                
+        elif setting == "timezone":
             try:
                 ZoneInfo(value)
                 user.timezone = value
