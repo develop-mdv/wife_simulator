@@ -1,0 +1,31 @@
+# Dependencies
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+*.egg-info/
+.eggs/
+dist/
+build/
+
+# Environment
+.env
+.venv/
+venv/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Data (sensitive)
+data/telegram.session
+data/telegram.session-journal
+data/messages.db
+data/messages.db-journal
+
+# OS
+.DS_Store
+Thumbs.db

@@ -1,0 +1,6 @@
+# Data directory for TG Wife AI
+# This folder contains:
+# - telegram.session - Telegram authorization session
+# - messages.db - SQLite database with message history
+#
+# DO NOT share these files - they contain sensitive data!

@@ -1,0 +1,11 @@
+services:
+  tg-wife-ai:
+    build: .
+    container_name: tg-wife-ai
+    restart: unless-stopped
+    env_file:
+      - .env
+    volumes:
+      - ./data:/app/data
+    stdin_open: true
+    tty: true
