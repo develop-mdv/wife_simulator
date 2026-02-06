@@ -1,636 +1,552 @@
 """
-Admin Bot for runtime configuration management.
-Uses python-telegram-bot v21+ in async mode (NOT run_polling!).
+Admin Bot with Multi-User Support and Onboarding Flow.
+Uses python-telegram-bot v21+ with ConversationHandler.
 """
 
 import re
 import time
 import logging
-from datetime import datetime, timedelta
 from typing import Optional
 from zoneinfo import ZoneInfo
 
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup, ReplyKeyboardRemove, KeyboardButton
 from telegram.ext import (
     Application,
     CommandHandler,
     CallbackQueryHandler,
     MessageHandler,
     ContextTypes,
+    ConversationHandler,
     filters,
 )
 
-from .settings_manager import SettingsManager
+from .user_data import UserData, UserState
 from .db import Database
+from .telethon_manager import TelethonManager
 
 logger = logging.getLogger(__name__)
 
-# Regex patterns for validation
-TIME_PATTERN = re.compile(r"^([01]?[0-9]|2[0-3]):([0-5][0-9])$")
-DURATION_PATTERN = re.compile(r"^(\d+)(m|h)$", re.IGNORECASE)
-UNTIL_PATTERN = re.compile(r"^until\s+(\d{1,2}):(\d{2})$", re.IGNORECASE)
+# Conversation states
+(
+    STATE_ONBOARDING_API_ID,
+    STATE_ONBOARDING_API_HASH,
+    STATE_ONBOARDING_PHONE,
+    STATE_ONBOARDING_CODE,
+    STATE_ONBOARDING_2FA,
+    STATE_ONBOARDING_TARGET,
+    STATE_MAIN_MENU,
+    STATE_SETTINGS_INPUT,
+) = range(8)
 
 
 class AdminBot:
-    """Admin bot for managing tg-wife-ai settings via Telegram Bot API."""
+    """Multi-user Admin Bot."""
     
-    def __init__(
-        self,
-        token: str,
-        admin_user_ids: list[int],
-        settings: SettingsManager,
-        db: Database,
-    ):
+    def __init__(self, token: str, db: Database, telethon_manager: TelethonManager):
         self.token = token
-        self.admin_user_ids = admin_user_ids
-        self.settings = settings
         self.db = db
+        self.tm = telethon_manager
         
-        # State for multi-message input (e.g., style_profile)
-        self._awaiting_input: dict[int, str] = {}  # user_id -> setting_key
-        self._awaiting_timeout: dict[int, float] = {}  # user_id -> timeout_ts
-        
-        # Build application
         self.app = Application.builder().token(token).build()
         self._register_handlers()
     
     def _register_handlers(self) -> None:
-        """Register all command and callback handlers."""
-        # Commands
-        self.app.add_handler(CommandHandler("start", self._cmd_start))
-        self.app.add_handler(CommandHandler("status", self._cmd_status))
-        self.app.add_handler(CommandHandler("on", self._cmd_on))
-        self.app.add_handler(CommandHandler("off", self._cmd_off))
-        self.app.add_handler(CommandHandler("pause", self._cmd_pause))
-        self.app.add_handler(CommandHandler("resume", self._cmd_resume))
-        self.app.add_handler(CommandHandler("set", self._cmd_set))
-        self.app.add_handler(CommandHandler("whoami", self._cmd_whoami))
-        self.app.add_handler(CommandHandler("last_sender", self._cmd_last_sender))
-        self.app.add_handler(CommandHandler("help", self._cmd_help))
+        """Register all handlers."""
         
-        # Inline keyboard callbacks
-        self.app.add_handler(CallbackQueryHandler(self._callback_handler))
-        
-        # Text message handler for multi-message input
-        self.app.add_handler(MessageHandler(
-            filters.TEXT & ~filters.COMMAND,
-            self._text_handler
-        ))
-    
-    async def _check_access(self, update: Update) -> bool:
-        """Check if user has admin access. Returns True if allowed."""
-        user = update.effective_user
-        if not user:
-            return False
-        
-        if user.id not in self.admin_user_ids:
-            # Log unauthorized access attempt
-            logger.warning(
-                f"⛔ Unauthorized access attempt: user_id={user.id}, "
-                f"username=@{user.username or 'N/A'}, "
-                f"name={user.full_name}"
-            )
-            await update.effective_message.reply_text("Нет доступа.")
-            return False
-        
-        return True
-    
-    def _build_main_menu(self) -> InlineKeyboardMarkup:
-        """Build main inline keyboard menu."""
-        ai_enabled = self.settings.is_ai_enabled()
-        ai_btn_text = "🤖 AI: ON ✅" if ai_enabled else "🤖 AI: OFF ❌"
-        ai_btn_action = "toggle_off" if ai_enabled else "toggle_on"
-        
-        keyboard = [
-            [
-                InlineKeyboardButton(ai_btn_text, callback_data=ai_btn_action),
-                InlineKeyboardButton("⏸ Пауза 30м", callback_data="pause_30m"),
-            ],
-            [
-                InlineKeyboardButton("⏸ Пауза 2ч", callback_data="pause_2h"),
-                InlineKeyboardButton("⏸ Пауза 12ч", callback_data="pause_12h"),
-            ],
-            [InlineKeyboardButton("▶️ Снять паузу", callback_data="resume")],
-            [InlineKeyboardButton("🌙 Тихие часы", callback_data="show_quiet")],
-            [InlineKeyboardButton("🎯 Target User", callback_data="show_target")],
-            [InlineKeyboardButton("🌍 Timezone", callback_data="show_timezone")],
-            [InlineKeyboardButton("🔄 Обновить", callback_data="refresh")],
-        ]
-        return InlineKeyboardMarkup(keyboard)
-    
-    def _format_status(self) -> str:
-        """Format current status as text."""
-        ai_enabled = self.settings.is_ai_enabled()
-        is_paused = self.settings.is_paused()
-        pause_remaining = self.settings.get_pause_remaining_seconds()
-        
-        target_id = self.settings.get_int("target_user_id", 0)
-        target_username = self.settings.get_str("target_username", "")
-        timezone = self.settings.get_str("timezone", "Europe/Moscow")
-        quiet_start = self.settings.get_str("quiet_hours_start", "—")
-        quiet_end = self.settings.get_str("quiet_hours_end", "—")
-        quiet_mode = self.settings.get_str("quiet_mode", "queue")
-        
-        # Current time in configured timezone
-        try:
-            tz = ZoneInfo(timezone)
-            now = datetime.now(tz)
-            current_time = now.strftime("%H:%M")
-        except Exception:
-            current_time = "N/A"
-        
-        lines = [
-            "📊 **Статус TG Wife AI**\n",
-            f"🤖 AI: {'ON ✅' if ai_enabled else 'OFF ❌'}",
-        ]
-        
-        if is_paused:
-            minutes = pause_remaining // 60
-            lines.append(f"⏸ Пауза: {minutes} мин. осталось")
-        
-        lines.extend([
-            f"\n🎯 Target: {target_id or target_username or '—'}",
-            f"🌍 Timezone: {timezone}",
-            f"🕐 Сейчас: {current_time}",
-            f"\n🌙 Тихие часы: {quiet_start or '—'} – {quiet_end or '—'}",
-            f"📋 Режим: {quiet_mode}",
-        ])
-        
-        # Last activity
-        last_activity = self.db.get_last_activity_ts()
-        if last_activity:
-            try:
-                tz = ZoneInfo(timezone)
-                dt = datetime.fromtimestamp(last_activity, tz)
-                lines.append(f"\n⏱ Последняя активность: {dt.strftime('%H:%M:%S')}")
-            except Exception:
-                pass
-        
-        return "\n".join(lines)
-    
-    # ========================
-    # Command Handlers
-    # ========================
-    
-    async def _cmd_start(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-        """Handle /start command."""
-        if not await self._check_access(update):
-            return
-        
-        text = self._format_status()
-        await update.message.reply_text(
-            text,
-            reply_markup=self._build_main_menu(),
-            parse_mode="Markdown"
+        # Onboarding Conversation
+        onboarding_handler = ConversationHandler(
+            entry_points=[CommandHandler("start", self._cmd_start)],
+            states={
+                STATE_ONBOARDING_API_ID: [MessageHandler(filters.TEXT & ~filters.COMMAND, self._handle_api_id)],
+                STATE_ONBOARDING_API_HASH: [MessageHandler(filters.TEXT & ~filters.COMMAND, self._handle_api_hash)],
+                STATE_ONBOARDING_PHONE: [MessageHandler(filters.TEXT | filters.CONTACT, self._handle_phone)],
+                STATE_ONBOARDING_CODE: [MessageHandler(filters.TEXT & ~filters.COMMAND, self._handle_code)],
+                STATE_ONBOARDING_2FA: [MessageHandler(filters.TEXT & ~filters.COMMAND, self._handle_2fa)],
+                STATE_ONBOARDING_TARGET: [MessageHandler(filters.TEXT | filters.CONTACT, self._handle_target)],
+                
+                STATE_MAIN_MENU: [
+                    CallbackQueryHandler(self._menu_callback),
+                    MessageHandler(filters.TEXT & ~filters.COMMAND, self._unknown_text)
+                ],
+                
+                STATE_SETTINGS_INPUT: [MessageHandler(filters.TEXT & ~filters.COMMAND, self._handle_setting_input)],
+            },
+            fallbacks=[
+                CommandHandler("start", self._cmd_start),
+                CommandHandler("cancel", self._cmd_cancel),
+                CallbackQueryHandler(self._global_back_handler, pattern="^back_to_.*"),
+                CallbackQueryHandler(self._cancel_handler, pattern="^cancel$")
+            ]
         )
-    
-    async def _cmd_status(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-        """Handle /status command."""
-        if not await self._check_access(update):
-            return
         
-        text = self._format_status()
-        await update.message.reply_text(text, parse_mode="Markdown")
-    
-    async def _cmd_on(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-        """Handle /on command - enable AI."""
-        if not await self._check_access(update):
-            return
-        
-        self.settings.set("ai_enabled", "true")
-        await update.message.reply_text("✅ Готово: AI=ON")
-    
-    async def _cmd_off(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-        """Handle /off command - disable AI."""
-        if not await self._check_access(update):
-            return
-        
-        self.settings.set("ai_enabled", "false")
-        await update.message.reply_text("✅ Готово: AI=OFF")
-    
-    async def _cmd_pause(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-        """Handle /pause command."""
-        if not await self._check_access(update):
-            return
-        
-        if not context.args:
-            await update.message.reply_text(
-                "Использование:\n"
-                "/pause 30m — пауза на 30 минут\n"
-                "/pause 2h — пауза на 2 часа\n"
-                "/pause until 23:00 — пауза до 23:00"
-            )
-            return
-        
-        arg = " ".join(context.args)
-        duration_seconds = self._parse_duration(arg)
-        
-        if duration_seconds is None:
-            await update.message.reply_text(
-                "❌ Неверный формат.\n"
-                "Примеры: 30m, 2h, until 23:00"
-            )
-            return
-        
-        pause_until = self.settings.set_pause(duration_seconds)
-        
-        # Format end time
-        try:
-            tz = self.settings.get_timezone()
-            end_dt = datetime.fromtimestamp(pause_until, tz)
-            end_time = end_dt.strftime("%H:%M")
-        except Exception:
-            end_time = "N/A"
-        
-        await update.message.reply_text(f"✅ Готово: автоответы приостановлены до {end_time}")
-    
-    async def _cmd_resume(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-        """Handle /resume command - clear pause."""
-        if not await self._check_access(update):
-            return
-        
-        self.settings.clear_pause()
-        await update.message.reply_text("✅ Готово: пауза снята")
-    
-    async def _cmd_set(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-        """Handle /set command."""
-        if not await self._check_access(update):
-            return
-        
-        if not context.args or len(context.args) < 1:
-            await update.message.reply_text(
-                "Использование: /set <key> <value>\n\n"
-                "Доступные ключи:\n"
-                "• target_id — ID целевого пользователя\n"
-                "• target_username — username без @\n"
-                "• quiet_start — начало тихих часов (HH:MM)\n"
-                "• quiet_end — конец тихих часов (HH:MM)\n"
-                "• timezone — часовой пояс (Europe/Moscow)\n"
-                "• quiet_mode — ignore или queue\n"
-                "• context_turns — кол-во сообщений в контексте\n"
-                "• rate_limit_count — макс. ответов\n"
-                "• rate_limit_window — период (сек)\n"
-                "• model — модель Gemini\n"
-                "• style_profile — (введите без значения)"
-            )
-            return
-        
-        key = context.args[0].lower()
-        value = " ".join(context.args[1:]) if len(context.args) > 1 else ""
-        
-        # Key mapping
-        key_map = {
-            "target_id": "target_user_id",
-            "target_username": "target_username",
-            "quiet_start": "quiet_hours_start",
-            "quiet_end": "quiet_hours_end",
-            "timezone": "timezone",
-            "quiet_mode": "quiet_mode",
-            "context_turns": "context_turns",
-            "rate_limit_count": "rate_limit_count",
-            "rate_limit_window": "rate_limit_window",
-            "model": "model_name",
-            "style_profile": "style_profile",
-        }
-        
-        setting_key = key_map.get(key)
-        if not setting_key:
-            await update.message.reply_text(f"❌ Неизвестный ключ: {key}")
-            return
-        
-        # Special handling for style_profile (multi-line input)
-        if setting_key == "style_profile" and not value:
-            self._awaiting_input[update.effective_user.id] = setting_key
-            self._awaiting_timeout[update.effective_user.id] = time.time() + 60
-            await update.message.reply_text(
-                "Отправьте следующим сообщением текст style_profile.\n"
-                "(60 секунд на ввод)"
-            )
-            return
-        
-        # Validate and set
-        error = self._validate_setting(setting_key, value)
-        if error:
-            await update.message.reply_text(f"❌ {error}")
-            return
-        
-        self.settings.set(setting_key, value)
-        await update.message.reply_text(f"✅ Готово: {setting_key}={value[:50]}{'...' if len(value) > 50 else ''}")
-    
-    async def _cmd_whoami(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-        """Handle /whoami command - show user's ID."""
-        if not await self._check_access(update):
-            return
-        
-        user = update.effective_user
-        await update.message.reply_text(
-            f"👤 Ваш Telegram ID: `{user.id}`\n"
-            f"Username: @{user.username or 'N/A'}",
-            parse_mode="Markdown"
-        )
-    
-    async def _cmd_last_sender(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-        """Handle /last_sender command."""
-        if not await self._check_access(update):
-            return
-        
-        sender_id = self.db.get_last_sender_id()
-        if sender_id:
-            await update.message.reply_text(f"📨 Последний отправитель: `{sender_id}`", parse_mode="Markdown")
-        else:
-            await update.message.reply_text("📨 Пока нет входящих сообщений")
-    
-    async def _cmd_help(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-        """Handle /help command."""
-        if not await self._check_access(update):
-            return
-        
-        help_text = """
-📖 **Команды админ-бота**
-
-/start — меню и статус
-/status — текущий статус
-/on — включить AI
-/off — выключить AI
-/pause <время> — пауза (30m, 2h, until 23:00)
-/resume — снять паузу
-/set <key> <value> — изменить настройку
-/whoami — ваш Telegram ID
-/last_sender — ID последнего отправителя
-/help — эта справка
-
-**Примеры /set:**
-/set target_id 123456789
-/set timezone Europe/Amsterdam
-/set quiet_start 23:00
-/set quiet_end 08:00
-/set quiet_mode queue
-/set style_profile (затем ввести текст)
-        """
-        await update.message.reply_text(help_text.strip(), parse_mode="Markdown")
-    
-    # ========================
-    # Callback Handler
-    # ========================
-    
-    async def _callback_handler(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-        """Handle inline keyboard callbacks."""
-        query = update.callback_query
-        if not query:
-            return
-        
-        # Check access
-        user = query.from_user
-        if user.id not in self.admin_user_ids:
-            logger.warning(f"⛔ Unauthorized callback: user_id={user.id}")
-            await query.answer("Нет доступа", show_alert=True)
-            return
-        
-        await query.answer()
-        data = query.data
-        
-        if data == "toggle_on":
-            self.settings.set("ai_enabled", "true")
-            await query.edit_message_text(
-                self._format_status(),
-                reply_markup=self._build_main_menu(),
-                parse_mode="Markdown"
-            )
-        
-        elif data == "toggle_off":
-            self.settings.set("ai_enabled", "false")
-            await query.edit_message_text(
-                self._format_status(),
-                reply_markup=self._build_main_menu(),
-                parse_mode="Markdown"
-            )
-        
-        elif data.startswith("pause_"):
-            duration_map = {
-                "pause_30m": 30 * 60,
-                "pause_2h": 2 * 60 * 60,
-                "pause_12h": 12 * 60 * 60,
-            }
-            seconds = duration_map.get(data, 30 * 60)
-            self.settings.set_pause(seconds)
-            await query.edit_message_text(
-                self._format_status(),
-                reply_markup=self._build_main_menu(),
-                parse_mode="Markdown"
-            )
-        
-        elif data == "resume":
-            self.settings.clear_pause()
-            await query.edit_message_text(
-                self._format_status(),
-                reply_markup=self._build_main_menu(),
-                parse_mode="Markdown"
-            )
-        
-        elif data == "show_quiet":
-            quiet_start = self.settings.get_str("quiet_hours_start", "—")
-            quiet_end = self.settings.get_str("quiet_hours_end", "—")
-            quiet_mode = self.settings.get_str("quiet_mode", "queue")
-            await query.message.reply_text(
-                f"🌙 **Тихие часы**\n\n"
-                f"Начало: {quiet_start or '—'}\n"
-                f"Конец: {quiet_end or '—'}\n"
-                f"Режим: {quiet_mode}\n\n"
-                f"Изменить:\n"
-                f"/set quiet_start HH:MM\n"
-                f"/set quiet_end HH:MM\n"
-                f"/set quiet_mode ignore|queue",
-                parse_mode="Markdown"
-            )
-        
-        elif data == "show_target":
-            target_id = self.settings.get_int("target_user_id", 0)
-            target_username = self.settings.get_str("target_username", "")
-            await query.message.reply_text(
-                f"🎯 **Target User**\n\n"
-                f"ID: {target_id or '—'}\n"
-                f"Username: {target_username or '—'}\n\n"
-                f"Изменить:\n"
-                f"/set target_id 123456789\n"
-                f"/set target_username username",
-                parse_mode="Markdown"
-            )
-        
-        elif data == "show_timezone":
-            timezone = self.settings.get_str("timezone", "Europe/Moscow")
-            try:
-                tz = ZoneInfo(timezone)
-                now = datetime.now(tz)
-                current_time = now.strftime("%Y-%m-%d %H:%M:%S")
-            except Exception:
-                current_time = "N/A"
-            
-            await query.message.reply_text(
-                f"🌍 **Timezone**\n\n"
-                f"Текущий: {timezone}\n"
-                f"Время: {current_time}\n\n"
-                f"Изменить:\n"
-                f"/set timezone Europe/Amsterdam",
-                parse_mode="Markdown"
-            )
-        
-        elif data == "refresh":
-            await query.edit_message_text(
-                self._format_status(),
-                reply_markup=self._build_main_menu(),
-                parse_mode="Markdown"
-            )
-    
-    # ========================
-    # Text Handler (for multi-message input)
-    # ========================
-    
-    async def _text_handler(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-        """Handle text messages for multi-message input."""
-        if not await self._check_access(update):
-            return
-        
-        user_id = update.effective_user.id
-        
-        # Check if awaiting input
-        if user_id not in self._awaiting_input:
-            return
-        
-        # Check timeout
-        if time.time() > self._awaiting_timeout.get(user_id, 0):
-            del self._awaiting_input[user_id]
-            if user_id in self._awaiting_timeout:
-                del self._awaiting_timeout[user_id]
-            await update.message.reply_text("⏰ Время истекло. Попробуйте снова.")
-            return
-        
-        setting_key = self._awaiting_input[user_id]
-        value = update.message.text.strip()
-        
-        # Clean up
-        del self._awaiting_input[user_id]
-        if user_id in self._awaiting_timeout:
-            del self._awaiting_timeout[user_id]
-        
-        # Validate and set
-        error = self._validate_setting(setting_key, value)
-        if error:
-            await update.message.reply_text(f"❌ {error}")
-            return
-        
-        self.settings.set(setting_key, value)
-        await update.message.reply_text(f"✅ Готово: {setting_key} обновлён")
+        self.app.add_handler(onboarding_handler)
     
     # ========================
     # Helpers
     # ========================
     
-    def _parse_duration(self, arg: str) -> Optional[int]:
-        """Parse duration string to seconds."""
-        arg = arg.strip()
-        
-        # Try "30m", "2h" format
-        match = DURATION_PATTERN.match(arg)
-        if match:
-            amount = int(match.group(1))
-            unit = match.group(2).lower()
-            if unit == "m":
-                return amount * 60
-            elif unit == "h":
-                return amount * 3600
-        
-        # Try "until 23:00" format
-        match = UNTIL_PATTERN.match(arg)
-        if match:
-            hour = int(match.group(1))
-            minute = int(match.group(2))
-            
-            if not (0 <= hour <= 23 and 0 <= minute <= 59):
-                return None
-            
-            tz = self.settings.get_timezone()
-            now = datetime.now(tz)
-            target = now.replace(hour=hour, minute=minute, second=0, microsecond=0)
-            
-            # If target is in the past, assume tomorrow
-            if target <= now:
-                target += timedelta(days=1)
-            
-            return int((target - now).total_seconds())
-        
-        return None
+    def _get_user(self, telegram_user) -> UserData:
+        """Get or create user."""
+        user = self.db.get_user(telegram_user.id)
+        if not user:
+            user = UserData(user_id=telegram_user.id)
+            self.db.save_user(user)
+        return user
     
-    def _validate_setting(self, key: str, value: str) -> Optional[str]:
-        """Validate setting value. Returns error message or None if valid."""
-        if key in ("quiet_hours_start", "quiet_hours_end"):
-            if value and not TIME_PATTERN.match(value):
-                return f"Неверный формат времени. Используйте HH:MM (например, 23:00)"
+    async def _send_main_menu(self, update: Update, user: UserData, edit: bool = False) -> None:
+        """Send main menu."""
+        status = "✅ AI ВКЛЮЧЕН" if user.ai_enabled else "❌ AI ВЫКЛЮЧЕН"
+        if user.is_paused():
+            minutes = int((user.pause_until_ts - time.time()) / 60)
+            status = f"⏸ ПАУЗА ({minutes} мин)"
         
-        elif key == "timezone":
+        text = (
+            f"📊 **Панель управления**\n\n"
+            f"Статус: **{status}**\n"
+            f"Цель: {user.target_name or user.target_username or user.target_user_id}\n"
+            f"Тихие часы: {user.quiet_hours_start or '—'} – {user.quiet_hours_end or '—'}\n"
+            f"Timezone: {user.timezone}"
+        )
+        
+        keyboard = [
+            [
+                InlineKeyboardButton("🤖 Включить AI", callback_data="toggle_on") 
+                if not user.ai_enabled else 
+                InlineKeyboardButton("🛑 Выключить AI", callback_data="toggle_off")
+            ],
+            [
+                InlineKeyboardButton("⏸ 30м", callback_data="pause_30m"),
+                InlineKeyboardButton("⏸ 2ч", callback_data="pause_2h"),
+                InlineKeyboardButton("▶️ Снять паузу", callback_data="resume")
+            ],
+            [
+                InlineKeyboardButton("⚙️ Настройки", callback_data="settings_menu"),
+                InlineKeyboardButton("🔄 Обновить", callback_data="refresh")
+            ]
+        ]
+        markup = InlineKeyboardMarkup(keyboard)
+        
+        if edit and update.callback_query:
+            try:
+                await update.callback_query.edit_message_text(text, reply_markup=markup, parse_mode="Markdown")
+            except Exception:
+                await update.callback_query.message.reply_text(text, reply_markup=markup, parse_mode="Markdown")
+        else:
+            await update.message.reply_text(text, reply_markup=markup, parse_mode="Markdown")
+            
+    # ========================
+    # Entry Point & Onboarding
+    # ========================
+    
+    async def _cmd_start(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+        """Start command - entry point."""
+        user = self._get_user(update.effective_user)
+        
+        # If already configured, go to main menu
+        if user.is_configured():
+            await self._send_main_menu(update, user)
+            return STATE_MAIN_MENU
+        
+        # Start onboarding
+        text = (
+            "👋 **Привет! Это TG Wife AI.**\n\n"
+            "Я помогу настроить персонального AI-ассистента, который сможет отвечать "
+            "на сообщения в Telegram вместо тебя (например, мужу/жене), пока ты занят(а).\n\n"
+            "**Как это работает:**\n"
+            "1. Мы подключим твой Telegram аккаунт (через официальный API)\n"
+            "2. Ты выберешь человека, которому нужно отвечать\n"
+            "3. Бот будет работать в фоновом режиме\n\n"
+            "Давай начнём настройку! Это займёт 2 минуты."
+        )
+        
+        keyboard = [[InlineKeyboardButton("🚀 Начать настройку", callback_data="start_setup")]]
+        await update.message.reply_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="Markdown")
+        
+        return STATE_ONBOARDING_API_ID  # Use callback to transition effectively, but handler expects state
+    
+    # We actually need a callback handler for the "Start" button to trigger the next step properly
+    # Handling this within states is tricky with mixed entry points. 
+    # Let's simplify: /start checks state. If setup needed, ask for API ID immediately after welcome text.
+    
+    # Actually, let's make _cmd_start return the first state directly if we print the API prompt.
+    
+    async def _cmd_cancel(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+        """Cancel current operation."""
+        await update.message.reply_text("❌ Действие отменено. Напиши /start чтобы начать заново.", reply_markup=ReplyKeyboardRemove())
+        return ConversationHandler.END
+
+    async def _cancel_handler(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+        """Cancel via inline button."""
+        await update.callback_query.answer()
+        await update.callback_query.message.reply_text("❌ Настройка отменена.", reply_markup=ReplyKeyboardRemove())
+        return ConversationHandler.END
+        
+    async def _global_back_handler(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+        """Handle 'Back' buttons globally."""
+        query = update.callback_query
+        await query.answer()
+        # This is complex to route generically. For now, specific step handlers will handle backs or resets.
+        # Implemented specific back logic in steps.
+        return ConversationHandler.END
+
+    # ========================
+    # Onboarding Steps
+    # ========================
+
+    async def _start_setup_callback(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+        """Callback from 'Start Setup' button (optional implementation details)."""
+        # Included for completeness if we used callback transistion
+        pass
+
+    async def _handle_api_id(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+        """Handle API_ID input (or start of flow)."""
+        # Check if this is actually the /start message trigger
+        # If user just typed /start, we sent welcome. Now we expect API ID.
+        # But wait, user might not have seen the prompt yet if we didn't send it in /start.
+        
+        # Let's refine flow:
+        # /start -> Welcome msg -> "Enter API ID"
+        pass
+        
+    # Redefining _cmd_start to be smoother
+    async def _cmd_start(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+        user = self._get_user(update.effective_user)
+        if user.is_configured():
+            await self._send_main_menu(update, user)
+            return STATE_MAIN_MENU
+
+        await update.message.reply_text(
+            "👋 **Привет! Настроим твоего AI-ассистента.**\n\n"
+            "**Шаг 1 из 4: Telegram API**\n"
+            "Для работы мне нужны API ID и API Hash от твоего аккаунта.\n"
+            "Это официальный метод Telegram для сторонних клиентов.\n\n"
+            "📖 **Инструкция:**\n"
+            "1. Открой my.telegram.org\n"
+            "2. Войди по номеру телефона\n"
+            "3. Перейди в 'API development tools'\n"
+            "4. Создай приложение (App title: WifeAI, Short name: wifeai)\n"
+            "5. Скопируй **App api_id**\n\n"
+            "👇 **Введи сейчас api_id (только цифры):**",
+            parse_mode="Markdown"
+        )
+        return STATE_ONBOARDING_API_ID
+
+    async def _handle_api_id(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+        text = update.message.text.strip()
+        if not text.isdigit():
+            await update.message.reply_text("❌ API ID должен состоять только из цифр. Попробуй еще раз:")
+            return STATE_ONBOARDING_API_ID
+            
+        context.user_data['api_id'] = int(text)
+        await update.message.reply_text(
+            "✅ Принято.\n\n"
+            "👇 **Теперь введи App api_hash (длинная строка):**"
+        )
+        return STATE_ONBOARDING_API_HASH
+
+    async def _handle_api_hash(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+        text = update.message.text.strip()
+        if len(text) < 10:
+            await update.message.reply_text("❌ Похоже на ошибку. Hash должен быть длинным. Попробуй еще раз:")
+            return STATE_ONBOARDING_API_HASH
+            
+        context.user_data['api_hash'] = text
+        
+        button = KeyboardButton(text="📱 Отправить мой номер", request_contact=True)
+        markup = ReplyKeyboardMarkup([[button]], one_time_keyboard=True, resize_keyboard=True)
+        
+        await update.message.reply_text(
+            "**Шаг 2 из 4: Авторизация**\n\n"
+            "Данные API приняты. Теперь нужно войти в аккаунт.\n"
+            "Нажми кнопку ниже или введи номер телефона (например +79001234567):",
+            reply_markup=markup,
+            parse_mode="Markdown"
+        )
+        return STATE_ONBOARDING_PHONE
+
+    async def _handle_phone(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+        user = self._get_user(update.effective_user)
+        
+        if update.message.contact:
+            phone = update.message.contact.phone_number
+        else:
+            phone = update.message.text.strip()
+        
+        # Save credentials to user DB temporarily (or permanently)
+        user.api_id = context.user_data['api_id']
+        user.api_hash = context.user_data['api_hash']
+        user.phone = phone
+        self.db.save_user(user)
+        
+        await update.message.reply_text(
+            "🔄 Отправляю код подтверждения...",
+            reply_markup=ReplyKeyboardRemove()
+        )
+        
+        # Trigger Telethon send_code
+        success, msg, phone_code_hash = await self.tm.send_code(user)
+        
+        if not success:
+            await update.message.reply_text(f"❌ Ошибка отправки кода: {msg}\nПроверь данные и начни заново: /start")
+            return ConversationHandler.END
+            
+        await update.message.reply_text(
+            "📩 **Код отправлен!**\n"
+            "Он придет в Telegram (на твоем устройстве).\n\n"
+            "👇 Введи код сюда (например: 12345):"
+        )
+        return STATE_ONBOARDING_CODE
+
+    async def _handle_code(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+        user = self._get_user(update.effective_user)
+        code = update.message.text.strip()
+        
+        await update.message.reply_text("🔄 Проверяю код...")
+        
+        success, msg, needs_2fa = await self.tm.sign_in(user, code)
+        
+        if needs_2fa:
+            await update.message.reply_text(
+                "🔐 **Требуется облачный пароль (2FA).**\n"
+                "👇 Введи свой пароль от двухэтапной аутентификации:"
+            )
+            return STATE_ONBOARDING_2FA
+            
+        if not success:
+            await update.message.reply_text(f"❌ Ошибка: {msg}\nПопробуй ввести код еще раз:")
+            return STATE_ONBOARDING_CODE
+        
+        # Auth success
+        await self._ask_for_target(update)
+        return STATE_ONBOARDING_TARGET
+
+    async def _handle_2fa(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+        user = self._get_user(update.effective_user)
+        password = update.message.text.strip()
+        
+        await update.message.reply_text("🔄 Проверяю пароль...")
+        
+        success, msg = await self.tm.sign_in_2fa(user, password)
+        
+        if not success:
+            await update.message.reply_text(f"❌ Ошибка: {msg}\nПопробуй еще раз:")
+            return STATE_ONBOARDING_2FA
+            
+        await self._ask_for_target(update)
+        return STATE_ONBOARDING_TARGET
+
+    async def _ask_for_target(self, update: Update) -> None:
+        """Helper to ask for target user."""
+        markup = ReplyKeyboardMarkup(
+            [[KeyboardButton(text="👤 Выбрать контакт из списка", request_contact=True)]],
+            one_time_keyboard=True,
+            resize_keyboard=True
+        )
+        await update.message.reply_text(
+            "✅ **Авторизация успешна!**\n\n"
+            "**Шаг 3 из 4: Выбор цели**\n"
+            "Кому я должен отвечать? Это может быть только один человек (муж/жена).\n\n"
+            "👇 **Отправь контакт этого человека** (скрепка -> Контакт) или напиши его @username:",
+            reply_markup=markup,
+            parse_mode="Markdown"
+        )
+        
+        # Start client in background to be ready for resolving
+        user = self._get_user(update.effective_user)
+        await self.tm.start_client_for_user(user)
+
+    async def _handle_target(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+        user = self._get_user(update.effective_user)
+        
+        target_id = None
+        target_name = None
+        target_username = None
+        
+        if update.message.contact:
+            c = update.message.contact
+            target_id = c.user_id
+            target_name = f"{c.first_name} {c.last_name or ''}".strip()
+            
+            # Note: sharing contact doesn't guarantee access if user blocked us or privacy, 
+            # but usually gives ID. Telethon client needs to resolve it to get access hash often.
+        else:
+            # Username input
+            username = update.message.text.strip()
+            if username.startswith("@"):
+                username = username[1:]
+            
+            await update.message.reply_text("🔄 Ищу пользователя...")
+            
+            # Use Telethon to resolve
+            success, tid, tname = await self.tm.resolve_username(user, username)
+            if not success:
+                await update.message.reply_text(f"❌ Не могу найти пользователя @{username}. Проверь имя или отправь контакт.")
+                return STATE_ONBOARDING_TARGET
+            
+            target_id = tid
+            target_name = tname
+            target_username = username
+            
+        if not target_id:
+             await update.message.reply_text(f"❌ Не удалось определить ID пользователя. Попробуйте отправить контакт.")
+             return STATE_ONBOARDING_TARGET
+             
+        # Save target
+        user.target_user_id = target_id
+        user.target_username = target_username
+        user.target_name = target_name
+        user.state = UserState.READY
+        self.db.save_user(user)
+        
+        await update.message.reply_text(
+            "🎉 **Настройка завершена!**\n\n"
+            f"Теперь я буду помогать общаться с: **{target_name}**\n"
+            "По умолчанию AI-ответы **выключены**, чтобы ты мог(ла) проверить настройки.",
+            reply_markup=ReplyKeyboardRemove(),
+            parse_mode="Markdown"
+        )
+        
+        await self._send_main_menu(update, user)
+        return STATE_MAIN_MENU
+
+    # ========================
+    # Main Menu Handlers
+    # ========================
+
+    async def _menu_callback(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+        query = update.callback_query
+        await query.answer()
+        data = query.data
+        user = self._get_user(update.effective_user)
+        
+        if data == "toggle_on":
+            user.ai_enabled = True
+            self.db.save_user(user)
+            await self._send_main_menu(update, user, edit=True)
+            
+        elif data == "toggle_off":
+            user.ai_enabled = False
+            self.db.save_user(user)
+            await self._send_main_menu(update, user, edit=True)
+            
+        elif data.startswith("pause_"):
+            parts = data.split("_")
+            duration = parts[1]
+            seconds = 0
+            if duration == "30m": seconds = 30*60
+            elif duration == "2h": seconds = 2*60*60
+            
+            user.pause_until_ts = int(time.time()) + seconds
+            self.db.save_user(user)
+            await self._send_main_menu(update, user, edit=True)
+            
+        elif data == "resume":
+            user.pause_until_ts = 0
+            self.db.save_user(user)
+            await self._send_main_menu(update, user, edit=True)
+            
+        elif data == "refresh":
+            await self._send_main_menu(update, user, edit=True)
+            
+        elif data == "settings_menu":
+            await self._send_settings_menu(update, user, edit=True)
+            
+        elif data.startswith("set_"):
+            return await self._handle_setting_selection(update, context, user, data)
+            
+        elif data == "back_to_main":
+            await self._send_main_menu(update, user, edit=True)
+            return STATE_MAIN_MENU
+            
+        return STATE_MAIN_MENU
+
+    async def _unknown_text(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+        """Handle unknown text in main menu."""
+        await update.message.reply_text("Используйте кнопки меню 👇")
+        user = self._get_user(update.effective_user)
+        await self._send_main_menu(update, user)
+        return STATE_MAIN_MENU
+
+    # ========================
+    # Settings Handlers
+    # ========================
+
+    async def _send_settings_menu(self, update: Update, user: UserData, edit: bool = False) -> None:
+        """Send settings menu."""
+        kb = [
+            [InlineKeyboardButton(f"Часовой пояс: {user.timezone}", callback_data="set_timezone")],
+            [InlineKeyboardButton(f"Тихие часы: {user.quiet_hours_start or 'Выкл'}", callback_data="set_quiet")],
+            [InlineKeyboardButton(f"Профиль стиля", callback_data="set_style")],
+            [InlineKeyboardButton("⬅️ Назад", callback_data="back_to_main")]
+        ]
+        text = "⚙️ **Настройки**\nВыберите, что хотите изменить:"
+        markup = InlineKeyboardMarkup(kb)
+        
+        if edit and update.callback_query:
+            await update.callback_query.edit_message_text(text, reply_markup=markup, parse_mode="Markdown")
+        else:
+            await update.message.reply_text(text, reply_markup=markup, parse_mode="Markdown")
+
+    async def _handle_setting_selection(self, update: Update, context: ContextTypes.DEFAULT_TYPE, user: UserData, data: str) -> int:
+        """Enter setting input mode."""
+        setting = data.replace("set_", "")
+        user.pending_setting = setting
+        self.db.save_user(user)
+        
+        if setting == "timezone":
+            text = "🌍 Введите часовой пояс (например, `Europe/Moscow`):"
+        elif setting == "quiet":
+            text = "🌙 Введите тихие часы в формате `Start-End` (например, `23:00-08:00`), или `off` чтобы выключить:"
+        elif setting == "style":
+            current = user.style_profile or "Стандартный"
+            text = f"🎨 **Текущий стиль:**\n{current}\n\n👇 Отправьте новый текст описания стиля (или /cancel):"
+        else:
+            text = "Введите значение:"
+            
+        await update.callback_query.message.reply_text(text, parse_mode="Markdown")
+        return STATE_SETTINGS_INPUT
+
+    async def _handle_setting_input(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+        user = self._get_user(update.effective_user)
+        setting = user.pending_setting
+        value = update.message.text.strip()
+        
+        if setting == "timezone":
             try:
                 ZoneInfo(value)
-            except Exception:
-                return f"Неверный часовой пояс: {value}. Используйте IANA формат (Europe/Moscow)"
+                user.timezone = value
+                await update.message.reply_text(f"✅ Часовой пояс изменен на {value}")
+            except:
+                await update.message.reply_text("❌ Неверный формат. Попробуйте еще раз (например Europe/Moscow):")
+                return STATE_SETTINGS_INPUT
+                
+        elif setting == "quiet":
+            if value.lower() == "off":
+                user.quiet_hours_start = None
+                user.quiet_hours_end = None
+                await update.message.reply_text("✅ Тихие часы выключены")
+            else:
+                parts = value.split("-")
+                if len(parts) == 2 and all(":" in p for p in parts):
+                    user.quiet_hours_start = parts[0].strip()
+                    user.quiet_hours_end = parts[1].strip()
+                    await update.message.reply_text(f"✅ Тихие часы: {user.quiet_hours_start} - {user.quiet_hours_end}")
+                else:
+                    await update.message.reply_text("❌ Неверный формат. Используйте HH:MM-HH:MM (например 23:00-08:00):")
+                    return STATE_SETTINGS_INPUT
+                    
+        elif setting == "style":
+            user.style_profile = value
+            await update.message.reply_text("✅ Стиль обновлен!")
+            
+        user.pending_setting = None
+        self.db.save_user(user)
         
-        elif key == "quiet_mode":
-            if value not in ("ignore", "queue"):
-                return "quiet_mode должен быть 'ignore' или 'queue'"
-        
-        elif key == "target_user_id":
-            if value:
-                try:
-                    uid = int(value)
-                    if uid <= 0:
-                        return "target_user_id должен быть положительным числом"
-                except ValueError:
-                    return "target_user_id должен быть числом"
-        
-        elif key == "context_turns":
-            try:
-                turns = int(value)
-                if not (1 <= turns <= 100):
-                    return "context_turns должен быть от 1 до 100"
-            except ValueError:
-                return "context_turns должен быть числом"
-        
-        elif key == "rate_limit_count":
-            try:
-                count = int(value)
-                if not (1 <= count <= 20):
-                    return "rate_limit_count должен быть от 1 до 20"
-            except ValueError:
-                return "rate_limit_count должен быть числом"
-        
-        elif key == "rate_limit_window":
-            try:
-                window = int(value)
-                if not (10 <= window <= 300):
-                    return "rate_limit_window должен быть от 10 до 300 секунд"
-            except ValueError:
-                return "rate_limit_window должен быть числом"
-        
-        return None
+        await self._send_main_menu(update, user)
+        return STATE_MAIN_MENU
 
 
-def create_admin_bot(
-    token: Optional[str],
-    admin_user_ids: list[int],
-    settings: SettingsManager,
-    db: Database,
-) -> Optional[Application]:
-    """
-    Create admin bot Application if configured.
-    
-    Returns None if token is missing or no admin users configured.
-    """
-    if not token:
-        logger.warning("⚠️ ADMIN_BOT_TOKEN не задан — админ-бот отключён")
-        return None
-    
-    if not admin_user_ids:
-        logger.warning("⚠️ ADMIN_USER_IDS пуст — админ-бот отключён")
-        return None
-    
-    bot = AdminBot(token, admin_user_ids, settings, db)
-    logger.info(f"✓ Админ-бот создан для {len(admin_user_ids)} админов")
+def create_admin_bot(token: str, db: Database, tm: TelethonManager) -> Application:
+    """Create and configure admin bot."""
+    bot = AdminBot(token, db, tm)
     return bot.app

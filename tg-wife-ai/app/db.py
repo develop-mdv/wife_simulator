@@ -1,13 +1,14 @@
 """
-Database module for storing message history, pending messages, and settings.
-Uses SQLite for persistent storage.
+Database module for multi-user support.
+Stores user data, messages, and pending messages per user.
 """
 
 import sqlite3
 import time
-from datetime import datetime
-from typing import Optional, Any
+from typing import Optional
 from contextlib import contextmanager
+
+from .user_data import UserData, UserState
 
 
 class Database:
@@ -31,97 +32,179 @@ class Database:
         with self._get_conn() as conn:
             cursor = conn.cursor()
             
-            # Message history table (with chat_id for proper dedup)
+            # Users table
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS users (
+                    user_id INTEGER PRIMARY KEY,
+                    api_id INTEGER,
+                    api_hash TEXT,
+                    phone TEXT,
+                    session_string TEXT,
+                    target_user_id INTEGER,
+                    target_username TEXT,
+                    target_name TEXT,
+                    state TEXT DEFAULT 'new',
+                    pending_setting TEXT,
+                    ai_enabled INTEGER DEFAULT 0,
+                    pause_until_ts INTEGER DEFAULT 0,
+                    quiet_hours_start TEXT,
+                    quiet_hours_end TEXT,
+                    quiet_mode TEXT DEFAULT 'queue',
+                    timezone TEXT DEFAULT 'Europe/Moscow',
+                    context_turns INTEGER DEFAULT 40,
+                    style_profile TEXT DEFAULT '',
+                    created_at INTEGER,
+                    last_activity_ts INTEGER DEFAULT 0
+                )
+            """)
+            
+            # Message history table (per user)
             cursor.execute("""
                 CREATE TABLE IF NOT EXISTS messages (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    owner_user_id INTEGER NOT NULL,
                     role TEXT NOT NULL,
                     text TEXT NOT NULL,
                     chat_id INTEGER,
                     message_id INTEGER,
-                    timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
+                    timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
+                    FOREIGN KEY (owner_user_id) REFERENCES users(user_id)
                 )
             """)
             
-            # Pending incoming messages (for quiet hours queue mode)
+            # Pending incoming messages (per user, for quiet hours)
             cursor.execute("""
                 CREATE TABLE IF NOT EXISTS pending_incoming (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    owner_user_id INTEGER NOT NULL,
                     chat_id INTEGER NOT NULL,
                     message_id INTEGER NOT NULL,
                     text TEXT NOT NULL,
                     timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
-                    UNIQUE(chat_id, message_id)
+                    UNIQUE(owner_user_id, chat_id, message_id),
+                    FOREIGN KEY (owner_user_id) REFERENCES users(user_id)
                 )
             """)
             
-            # State table for tracking last processed message
+            # Create indexes
+            cursor.execute("CREATE INDEX IF NOT EXISTS idx_messages_owner ON messages(owner_user_id)")
+            cursor.execute("CREATE INDEX IF NOT EXISTS idx_pending_owner ON pending_incoming(owner_user_id)")
+    
+    # ========================
+    # User Methods
+    # ========================
+    
+    def get_user(self, user_id: int) -> Optional[UserData]:
+        """Get user by ID."""
+        with self._get_conn() as conn:
+            cursor = conn.cursor()
+            cursor.execute("SELECT * FROM users WHERE user_id = ?", (user_id,))
+            row = cursor.fetchone()
+            if row:
+                return UserData.from_dict(dict(row))
+            return None
+    
+    def save_user(self, user: UserData) -> None:
+        """Save or update user."""
+        data = user.to_dict()
+        with self._get_conn() as conn:
+            cursor = conn.cursor()
             cursor.execute("""
-                CREATE TABLE IF NOT EXISTS state (
-                    key TEXT PRIMARY KEY,
-                    value TEXT
-                )
-            """)
-            
-            # Settings table for runtime configuration
+                INSERT INTO users (
+                    user_id, api_id, api_hash, phone, session_string,
+                    target_user_id, target_username, target_name, state, pending_setting,
+                    ai_enabled, pause_until_ts, quiet_hours_start, quiet_hours_end,
+                    quiet_mode, timezone, context_turns, style_profile,
+                    created_at, last_activity_ts
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(user_id) DO UPDATE SET
+                    api_id = excluded.api_id,
+                    api_hash = excluded.api_hash,
+                    phone = excluded.phone,
+                    session_string = excluded.session_string,
+                    target_user_id = excluded.target_user_id,
+                    target_username = excluded.target_username,
+                    target_name = excluded.target_name,
+                    state = excluded.state,
+                    pending_setting = excluded.pending_setting,
+                    ai_enabled = excluded.ai_enabled,
+                    pause_until_ts = excluded.pause_until_ts,
+                    quiet_hours_start = excluded.quiet_hours_start,
+                    quiet_hours_end = excluded.quiet_hours_end,
+                    quiet_mode = excluded.quiet_mode,
+                    timezone = excluded.timezone,
+                    context_turns = excluded.context_turns,
+                    style_profile = excluded.style_profile,
+                    last_activity_ts = excluded.last_activity_ts
+            """, (
+                data["user_id"], data["api_id"], data["api_hash"], data["phone"],
+                data["session_string"], data["target_user_id"], data["target_username"],
+                data["target_name"], data["state"], data["pending_setting"],
+                data["ai_enabled"], data["pause_until_ts"], data["quiet_hours_start"],
+                data["quiet_hours_end"], data["quiet_mode"], data["timezone"],
+                data["context_turns"], data["style_profile"], data["created_at"],
+                data["last_activity_ts"]
+            ))
+    
+    def get_all_configured_users(self) -> list[UserData]:
+        """Get all users who have completed setup."""
+        with self._get_conn() as conn:
+            cursor = conn.cursor()
             cursor.execute("""
-                CREATE TABLE IF NOT EXISTS settings (
-                    key TEXT PRIMARY KEY,
-                    value TEXT NOT NULL,
-                    updated_ts INTEGER DEFAULT (strftime('%s', 'now'))
-                )
+                SELECT * FROM users 
+                WHERE state = 'ready' AND session_string IS NOT NULL
             """)
-            
-            # Migration: add chat_id column if missing (for existing DBs)
-            cursor.execute("PRAGMA table_info(messages)")
-            columns = [row[1] for row in cursor.fetchall()]
-            if "chat_id" not in columns:
-                cursor.execute("ALTER TABLE messages ADD COLUMN chat_id INTEGER")
-            
-            # Migration: add chat_id to pending_incoming if missing
-            cursor.execute("PRAGMA table_info(pending_incoming)")
-            columns = [row[1] for row in cursor.fetchall()]
-            if "chat_id" not in columns:
-                cursor.execute("ALTER TABLE pending_incoming ADD COLUMN chat_id INTEGER DEFAULT 0")
+            return [UserData.from_dict(dict(row)) for row in cursor.fetchall()]
+    
+    def delete_user(self, user_id: int) -> None:
+        """Delete user and their data."""
+        with self._get_conn() as conn:
+            cursor = conn.cursor()
+            cursor.execute("DELETE FROM messages WHERE owner_user_id = ?", (user_id,))
+            cursor.execute("DELETE FROM pending_incoming WHERE owner_user_id = ?", (user_id,))
+            cursor.execute("DELETE FROM users WHERE user_id = ?", (user_id,))
     
     # ========================
     # Message History Methods
     # ========================
     
-    def add_message(self, role: str, text: str, chat_id: Optional[int] = None, message_id: Optional[int] = None) -> None:
+    def add_message(self, owner_user_id: int, role: str, text: str, 
+                    chat_id: Optional[int] = None, message_id: Optional[int] = None) -> None:
         """Add a message to history."""
         with self._get_conn() as conn:
             cursor = conn.cursor()
             cursor.execute(
-                "INSERT INTO messages (role, text, chat_id, message_id) VALUES (?, ?, ?, ?)",
-                (role, text, chat_id, message_id)
+                "INSERT INTO messages (owner_user_id, role, text, chat_id, message_id) VALUES (?, ?, ?, ?, ?)",
+                (owner_user_id, role, text, chat_id, message_id)
             )
     
-    def get_context(self, limit: int) -> list[dict]:
+    def get_context(self, owner_user_id: int, limit: int) -> list[dict]:
         """Get recent messages for context (oldest first)."""
         with self._get_conn() as conn:
             cursor = conn.cursor()
             cursor.execute("""
                 SELECT role, text, timestamp 
                 FROM messages 
+                WHERE owner_user_id = ?
                 ORDER BY id DESC 
                 LIMIT ?
-            """, (limit,))
+            """, (owner_user_id, limit))
             rows = cursor.fetchall()
             
-            # Reverse to get chronological order
             return [
                 {"role": dict(row)["role"], "content": dict(row)["text"]}
                 for row in reversed(rows)
             ]
     
-    def is_message_processed(self, chat_id: int, message_id: int) -> bool:
-        """Check if a message has already been processed (deduplication by chat_id + message_id)."""
+    def is_message_processed(self, owner_user_id: int, chat_id: int, message_id: int) -> bool:
+        """Check if a message has already been processed."""
         with self._get_conn() as conn:
             cursor = conn.cursor()
             cursor.execute(
-                "SELECT 1 FROM messages WHERE chat_id = ? AND message_id = ? AND role = 'user' LIMIT 1",
-                (chat_id, message_id)
+                """SELECT 1 FROM messages 
+                   WHERE owner_user_id = ? AND chat_id = ? AND message_id = ? AND role = 'user' 
+                   LIMIT 1""",
+                (owner_user_id, chat_id, message_id)
             )
             return cursor.fetchone() is not None
     
@@ -129,121 +212,39 @@ class Database:
     # Pending Queue Methods
     # ========================
     
-    def add_pending_message(self, chat_id: int, message_id: int, text: str) -> None:
-        """Add a message to pending queue (quiet hours)."""
+    def add_pending_message(self, owner_user_id: int, chat_id: int, message_id: int, text: str) -> None:
+        """Add a message to pending queue."""
         with self._get_conn() as conn:
             cursor = conn.cursor()
             try:
                 cursor.execute(
-                    "INSERT INTO pending_incoming (chat_id, message_id, text) VALUES (?, ?, ?)",
-                    (chat_id, message_id, text)
+                    "INSERT INTO pending_incoming (owner_user_id, chat_id, message_id, text) VALUES (?, ?, ?, ?)",
+                    (owner_user_id, chat_id, message_id, text)
                 )
             except sqlite3.IntegrityError:
-                # Already exists, ignore
-                pass
+                pass  # Already exists
     
-    def get_pending_messages(self) -> list[dict]:
-        """Get all pending messages (oldest first)."""
+    def get_pending_messages(self, owner_user_id: int) -> list[dict]:
+        """Get all pending messages for user."""
         with self._get_conn() as conn:
             cursor = conn.cursor()
             cursor.execute("""
                 SELECT chat_id, message_id, text, timestamp 
                 FROM pending_incoming 
+                WHERE owner_user_id = ?
                 ORDER BY id ASC
-            """)
+            """, (owner_user_id,))
             return [dict(row) for row in cursor.fetchall()]
     
-    def clear_pending_messages(self) -> None:
-        """Clear all pending messages after processing."""
+    def clear_pending_messages(self, owner_user_id: int) -> None:
+        """Clear all pending messages for user."""
         with self._get_conn() as conn:
             cursor = conn.cursor()
-            cursor.execute("DELETE FROM pending_incoming")
+            cursor.execute("DELETE FROM pending_incoming WHERE owner_user_id = ?", (owner_user_id,))
     
-    def has_pending_messages(self) -> bool:
-        """Check if there are any pending messages."""
+    def has_pending_messages(self, owner_user_id: int) -> bool:
+        """Check if user has pending messages."""
         with self._get_conn() as conn:
             cursor = conn.cursor()
-            cursor.execute("SELECT 1 FROM pending_incoming LIMIT 1")
+            cursor.execute("SELECT 1 FROM pending_incoming WHERE owner_user_id = ? LIMIT 1", (owner_user_id,))
             return cursor.fetchone() is not None
-    
-    def get_pending_count(self) -> int:
-        """Get count of pending messages."""
-        with self._get_conn() as conn:
-            cursor = conn.cursor()
-            cursor.execute("SELECT COUNT(*) FROM pending_incoming")
-            return cursor.fetchone()[0]
-    
-    # ========================
-    # Settings Methods
-    # ========================
-    
-    def get_setting(self, key: str, default: Optional[str] = None) -> Optional[str]:
-        """Get a setting value from database."""
-        with self._get_conn() as conn:
-            cursor = conn.cursor()
-            cursor.execute("SELECT value FROM settings WHERE key = ?", (key,))
-            row = cursor.fetchone()
-            return row[0] if row else default
-    
-    def set_setting(self, key: str, value: str) -> None:
-        """Set a setting value in database."""
-        with self._get_conn() as conn:
-            cursor = conn.cursor()
-            cursor.execute("""
-                INSERT INTO settings (key, value, updated_ts) 
-                VALUES (?, ?, ?)
-                ON CONFLICT(key) DO UPDATE SET value = ?, updated_ts = ?
-            """, (key, value, int(time.time()), value, int(time.time())))
-    
-    def get_all_settings(self) -> dict[str, str]:
-        """Get all settings as a dictionary."""
-        with self._get_conn() as conn:
-            cursor = conn.cursor()
-            cursor.execute("SELECT key, value FROM settings")
-            return {row["key"]: row["value"] for row in cursor.fetchall()}
-    
-    def delete_setting(self, key: str) -> None:
-        """Delete a setting from database."""
-        with self._get_conn() as conn:
-            cursor = conn.cursor()
-            cursor.execute("DELETE FROM settings WHERE key = ?", (key,))
-    
-    # ========================
-    # State Methods
-    # ========================
-    
-    def get_last_sender_id(self) -> Optional[int]:
-        """Get the last incoming message sender ID."""
-        with self._get_conn() as conn:
-            cursor = conn.cursor()
-            cursor.execute("SELECT value FROM state WHERE key = 'last_sender_id'")
-            row = cursor.fetchone()
-            return int(row[0]) if row else None
-    
-    def set_last_sender_id(self, sender_id: int) -> None:
-        """Set the last incoming message sender ID."""
-        with self._get_conn() as conn:
-            cursor = conn.cursor()
-            cursor.execute("""
-                INSERT INTO state (key, value) VALUES ('last_sender_id', ?)
-                ON CONFLICT(key) DO UPDATE SET value = ?
-            """, (str(sender_id), str(sender_id)))
-    
-    def get_last_activity_ts(self) -> Optional[int]:
-        """Get timestamp of last activity."""
-        with self._get_conn() as conn:
-            cursor = conn.cursor()
-            cursor.execute("SELECT value FROM state WHERE key = 'last_activity_ts'")
-            row = cursor.fetchone()
-            return int(row[0]) if row else None
-    
-    def set_last_activity_ts(self, ts: Optional[int] = None) -> None:
-        """Set timestamp of last activity."""
-        if ts is None:
-            ts = int(time.time())
-        with self._get_conn() as conn:
-            cursor = conn.cursor()
-            cursor.execute("""
-                INSERT INTO state (key, value) VALUES ('last_activity_ts', ?)
-                ON CONFLICT(key) DO UPDATE SET value = ?
-            """, (str(ts), str(ts)))

@@ -23,7 +23,7 @@ class SettingsManager:
     
     # Default values (fallbacks if neither DB nor ENV has value)
     DEFAULTS = {
-        "ai_enabled": "true",
+        "ai_enabled": "false",  # OFF by default, enable via admin bot
         "pause_until_ts": "0",
         "target_user_id": "",
         "target_username": "",
