@@ -1,10 +1,13 @@
 """
 Database module for multi-user support.
 Stores user data, messages, and pending messages per user.
+Handles migration from old single-user schema.
 """
 
 import sqlite3
 import time
+import os
+import shutil
 from typing import Optional
 from contextlib import contextmanager
 
@@ -27,8 +30,46 @@ class Database:
         finally:
             conn.close()
     
+    def _check_needs_migration(self) -> bool:
+        """Check if database needs migration from old schema."""
+        if not os.path.exists(self.db_path):
+            return False
+        
+        with self._get_conn() as conn:
+            cursor = conn.cursor()
+            
+            # Check if old schema (messages table without owner_user_id)
+            cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='messages'")
+            if not cursor.fetchone():
+                return False
+            
+            cursor.execute("PRAGMA table_info(messages)")
+            columns = [row[1] for row in cursor.fetchall()]
+            
+            # Old schema has 'role', 'text' but no 'owner_user_id'
+            if 'owner_user_id' not in columns and 'role' in columns:
+                return True
+        
+        return False
+    
+    def _migrate_old_schema(self) -> None:
+        """Backup old database and start fresh."""
+        backup_path = self.db_path + ".backup_v1"
+        
+        # Backup old database
+        if os.path.exists(self.db_path):
+            shutil.copy2(self.db_path, backup_path)
+            os.remove(self.db_path)
+            print(f"⚠️ Old database backed up to {backup_path}")
+            print("📦 Creating new multi-user database...")
+    
     def _init_db(self):
         """Initialize database tables."""
+        
+        # Check for old schema
+        if self._check_needs_migration():
+            self._migrate_old_schema()
+        
         with self._get_conn() as conn:
             cursor = conn.cursor()
             
@@ -67,8 +108,7 @@ class Database:
                     text TEXT NOT NULL,
                     chat_id INTEGER,
                     message_id INTEGER,
-                    timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
-                    FOREIGN KEY (owner_user_id) REFERENCES users(user_id)
+                    timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
                 )
             """)
             
@@ -81,14 +121,16 @@ class Database:
                     message_id INTEGER NOT NULL,
                     text TEXT NOT NULL,
                     timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
-                    UNIQUE(owner_user_id, chat_id, message_id),
-                    FOREIGN KEY (owner_user_id) REFERENCES users(user_id)
+                    UNIQUE(owner_user_id, chat_id, message_id)
                 )
             """)
             
-            # Create indexes
-            cursor.execute("CREATE INDEX IF NOT EXISTS idx_messages_owner ON messages(owner_user_id)")
-            cursor.execute("CREATE INDEX IF NOT EXISTS idx_pending_owner ON pending_incoming(owner_user_id)")
+            # Create indexes (only if tables exist with correct columns)
+            try:
+                cursor.execute("CREATE INDEX IF NOT EXISTS idx_messages_owner ON messages(owner_user_id)")
+                cursor.execute("CREATE INDEX IF NOT EXISTS idx_pending_owner ON pending_incoming(owner_user_id)")
+            except sqlite3.OperationalError:
+                pass  # Ignore if already exists or column missing
     
     # ========================
     # User Methods
